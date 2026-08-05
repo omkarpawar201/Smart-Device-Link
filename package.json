@@ -1,0 +1,35 @@
+{
+  "name": "diy-phone-link",
+  "version": "1.0.0",
+  "description": "Smart Device Link - An Intelligent Phone-to-PC Integration Platform",
+  "main": "main.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev:vite": "vite",
+    "dev:electron": "electron .",
+    "dev": "concurrently -k \"npm run dev:vite\" \"npm run dev:electron\"",
+    "build:vite": "vite build",
+    "build": "npm run build:vite && electron-builder"
+  },
+  "keywords": [
+    "phone-link",
+    "kde-connect",
+    "electron",
+    "react",
+    "bluetooth-hfp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "lucide-react": "^0.344.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^8.2.2",
+    "electron": "^29.1.0",
+    "electron-builder": "^24.13.3",
+    "vite": "^5.1.4"
+  }
+}
