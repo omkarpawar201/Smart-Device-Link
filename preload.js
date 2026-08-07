@@ -30,6 +30,9 @@ contextBridge.exposeInMainWorld('api', {
     onContactsUpdated: (callback) => {
         ipcRenderer.on('contacts-updated', (event, data) => callback(data));
     },
+    onPhotosUpdated: (callback) => {
+        ipcRenderer.on('photos-updated', (event, data) => callback(data));
+    },
 
     // General IPC Send / Invoke Bridge
     send: (channel, data) => {
@@ -43,6 +46,10 @@ contextBridge.exposeInMainWorld('api', {
             'fetch-contacts',
             'share-url',
             'dial-number',
+            'download-file',
+            'upload-file',
+            'delete-file',
+            'scan-photos',
             'answer-call',
             'decline-call'
         ];
@@ -51,7 +58,7 @@ contextBridge.exposeInMainWorld('api', {
         }
     },
     invoke: (channel, data) => {
-        const validChannels = ['get-discovered-devices', 'pair-device', 'accept-pair', 'unpair-device'];
+        const validChannels = ['get-discovered-devices', 'pair-device', 'accept-pair', 'unpair-device', 'fetch-files'];
         if (validChannels.includes(channel)) {
             return ipcRenderer.invoke(channel, data);
         }

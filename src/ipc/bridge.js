@@ -20,6 +20,9 @@ const SmsPlugin = require('../kdeconnect/plugins/SmsPlugin');
 const ContactsPlugin = require('../kdeconnect/plugins/ContactsPlugin');
 const SharePlugin = require('../kdeconnect/plugins/SharePlugin');
 
+// Phase 5 Plugins
+const SftpPlugin = require('../kdeconnect/plugins/SftpPlugin');
+
 let cryptoHelper = null;
 let deviceManager = null;
 let packetRouter = null;
@@ -38,9 +41,10 @@ let telephonyPlugin = null;
 let smsPlugin = null;
 let contactsPlugin = null;
 let sharePlugin = null;
+let sftpPlugin = null;
 
 function initKDEConnectBridge(mainWindow) {
-    console.log('[KDEConnect Bridge] Initializing Protocol Engine & Communication Plugins...');
+    console.log('[KDEConnect Bridge] Initializing Protocol Engine & Storage Plugins...');
 
     const pluginEvents = new EventEmitter();
 
@@ -61,6 +65,7 @@ function initKDEConnectBridge(mainWindow) {
     smsPlugin = new SmsPlugin(pluginEvents);
     contactsPlugin = new ContactsPlugin(pluginEvents);
     sharePlugin = new SharePlugin(pluginEvents);
+    sftpPlugin = new SftpPlugin(pluginEvents);
 
     // Register Plugins in PacketRouter
     packetRouter.registerPlugin(notificationPlugin);
@@ -74,6 +79,7 @@ function initKDEConnectBridge(mainWindow) {
     packetRouter.registerPlugin(smsPlugin);
     packetRouter.registerPlugin(contactsPlugin);
     packetRouter.registerPlugin(sharePlugin);
+    packetRouter.registerPlugin(sftpPlugin);
 
     // Start UDP discovery
     deviceManager.startDiscovery();
@@ -89,7 +95,7 @@ function initKDEConnectBridge(mainWindow) {
         }
     });
 
-    // Forward Phase 3 & 4 Plugin Events to React Renderer
+    // Forward Plugin Events to React Renderer
     pluginEvents.on('notificationReceived', (data) => {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notification-received', data);
     });
@@ -110,43 +116,71 @@ function initKDEConnectBridge(mainWindow) {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('media-state-changed', data);
     });
 
-    pluginEvents.on('incomingCall', (callData) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('incoming-call', callData);
+    pluginEvents.on('incomingCall', (data) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('incoming-call', data);
     });
 
-    pluginEvents.on('smsThreadsUpdated', (threads) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('sms-threads-updated', threads);
+    pluginEvents.on('smsThreadsUpdated', (data) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('sms-threads-updated', data);
     });
 
-    pluginEvents.on('contactsUpdated', (contactsList) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('contacts-updated', contactsList);
+    pluginEvents.on('contactsUpdated', (data) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('contacts-updated', data);
     });
 
-    // IPC Handlers for Phase 4 UI Actions
-    ipcMain.on('send-sms', (event, { phoneNumber, messageText }) => {
+    // Phase 5 IPC Handlers
+    ipcMain.handle('fetch-files', async (event, { path }) => {
+        try {
+            return await sftpPlugin.listDirectory(path || '/sdcard');
+        } catch (e) {
+            console.warn('[Bridge] fetch-files error:', e.message);
+            return [];
+        }
+    });
+
+    ipcMain.on('download-file', async (event, { remotePath, name }) => {
         const activeDev = getFirstActiveDevice();
         if (activeDev) {
-            smsPlugin.sendSms(activeDev, phoneNumber, messageText);
+            const desktopPath = require('path').join(require('os').homedir(), 'Desktop', name);
+            console.log(`[Bridge] Downloading ${remotePath} to ${desktopPath}...`);
+            await sftpPlugin.downloadFile(remotePath, desktopPath);
         }
+    });
+
+    ipcMain.on('upload-file', async (event, { localPath, remoteDirectory }) => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev) {
+            const fileName = require('path').basename(localPath);
+            const remotePath = `${remoteDirectory}/${fileName}`;
+            console.log(`[Bridge] Uploading ${localPath} to ${remotePath}...`);
+            await sftpPlugin.uploadFile(localPath, remotePath);
+        }
+    });
+
+    ipcMain.on('delete-file', async (event, { remotePath, isDir }) => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev) {
+            await sftpPlugin.deleteItem(remotePath, isDir);
+        }
+    });
+
+    ipcMain.on('send-sms', (event, { phoneNumber, messageText }) => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev) smsPlugin.sendSms(activeDev, phoneNumber, messageText);
     });
 
     ipcMain.on('fetch-contacts', () => {
         const activeDev = getFirstActiveDevice();
-        if (activeDev) {
-            contactsPlugin.requestAllContacts(activeDev);
-        }
+        if (activeDev) contactsPlugin.requestAllContacts(activeDev);
     });
 
     ipcMain.on('share-url', (event, { url }) => {
         const activeDev = getFirstActiveDevice();
-        if (activeDev) {
-            sharePlugin.shareUrlToPhone(activeDev, url);
-        }
+        if (activeDev) sharePlugin.shareUrlToPhone(activeDev, url);
     });
 
     ipcMain.on('dial-number', (event, { number }) => {
         console.log(`[Bridge] Dialing number: ${number}`);
-        // Triggers Bluetooth HFP audio & Android telephony action
     });
 
     ipcMain.on('send-reply', (event, { requestReplyId, text }) => {
@@ -220,6 +254,7 @@ function connectToDevice(deviceInfo, mainWindow) {
         connectivityPlugin.requestReport(deviceConnection);
         smsPlugin.requestAllThreads(deviceConnection);
         contactsPlugin.requestAllContacts(deviceConnection);
+        sftpPlugin.requestSftpMount(deviceConnection);
     });
 
     deviceConnection.on('packet', (packet) => {
