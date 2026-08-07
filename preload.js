@@ -21,8 +21,14 @@ contextBridge.exposeInMainWorld('api', {
     onMediaStateChanged: (callback) => {
         ipcRenderer.on('media-state-changed', (event, data) => callback(data));
     },
-    onCallStateChanged: (callback) => {
-        ipcRenderer.on('call-state-changed', (event, data) => callback(data));
+    onIncomingCall: (callback) => {
+        ipcRenderer.on('incoming-call', (event, data) => callback(data));
+    },
+    onSmsThreadsUpdated: (callback) => {
+        ipcRenderer.on('sms-threads-updated', (event, data) => callback(data));
+    },
+    onContactsUpdated: (callback) => {
+        ipcRenderer.on('contacts-updated', (event, data) => callback(data));
     },
 
     // General IPC Send / Invoke Bridge
@@ -34,6 +40,9 @@ contextBridge.exposeInMainWorld('api', {
             'media-control',
             'ring-phone',
             'send-sms',
+            'fetch-contacts',
+            'share-url',
+            'dial-number',
             'answer-call',
             'decline-call'
         ];
