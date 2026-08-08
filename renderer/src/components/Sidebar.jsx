@@ -14,10 +14,10 @@ import {
     Settings
 } from 'lucide-react';
 
-export default function Sidebar({ activeTab, setActiveTab }) {
+export default function Sidebar({ activeTab, setActiveTab, notificationCount }) {
     const menuItems = [
-        { id: 'notifications', label: 'Notifications', icon: Bell, badge: 3 },
-        { id: 'messages', label: 'Messages', icon: MessageSquare, badge: 1 },
+        { id: 'notifications', label: 'Notifications', icon: Bell, badge: notificationCount > 0 ? notificationCount : null },
+        { id: 'messages', label: 'Messages', icon: MessageSquare },
         { id: 'calls', label: 'Phone Calls', icon: PhoneCall },
         { id: 'contacts', label: 'Contacts', icon: Users },
         { id: 'photos', label: 'Photos', icon: Image },
@@ -29,6 +29,7 @@ export default function Sidebar({ activeTab, setActiveTab }) {
         { id: 'ai', label: 'AI Assistant', icon: Bot, highlight: true },
         { id: 'settings', label: 'Settings', icon: Settings }
     ];
+
 
     return (
         <aside

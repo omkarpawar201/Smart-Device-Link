@@ -5,6 +5,7 @@ class NotificationPlugin extends BasePlugin {
         super('NotificationPlugin');
         this.emitter = eventEmitter;
         this.notifications = new Map(); // id -> notification object
+        this.dismissedSignatures = new Map(); // notifId -> "title|text"
     }
 
     getCapabilities() {
@@ -18,18 +19,32 @@ class NotificationPlugin extends BasePlugin {
             if (body.isCancel) {
                 // Notification dismissed on phone
                 this.notifications.delete(body.id);
+                if (body.id) this.dismissedSignatures.delete(body.id);
                 if (this.emitter) {
                     this.emitter.emit('notificationDismissed', { id: body.id, deviceId: device.info.id });
                 }
                 return;
             }
 
+            const notifId = body.id || `notif_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+            const title = body.title || 'Notification';
+            const text = body.text || body.ticker || '';
+            const signature = `${title}|${text}`;
+
+            // If this exact notification content was already dismissed, ignore duplicate re-sync
+            if (this.dismissedSignatures.get(notifId) === signature) {
+                return;
+            }
+
+            // Fresh content or updated text: clear old signature
+            this.dismissedSignatures.delete(notifId);
+
             const notifData = {
-                id: body.id || `notif_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+                id: notifId,
                 deviceId: device.info.id,
                 appName: body.appName || 'Android App',
-                title: body.title || 'Notification',
-                text: body.text || body.ticker || '',
+                title: title,
+                text: text,
                 ticker: body.ticker || '',
                 time: Date.now(),
                 requestReplyId: body.requestReplyId || null,
@@ -41,6 +56,10 @@ class NotificationPlugin extends BasePlugin {
 
             if (this.emitter) {
                 this.emitter.emit('notificationReceived', notifData);
+                const appLower = (notifData.appName || '').toLowerCase();
+                if (appLower.includes('message') || appLower.includes('sms') || appLower.includes('messaging')) {
+                    this.emitter.emit('smsNotificationReceived', notifData);
+                }
             }
         }
     }
@@ -62,20 +81,42 @@ class NotificationPlugin extends BasePlugin {
     }
 
     dismissNotification(device, notificationId) {
-        if (!device || !notificationId) return false;
+        if (!notificationId) return false;
 
-        const dismissPacket = {
-            id: Date.now(),
-            type: 'kdeconnect.notification',
-            body: {
-                id: notificationId,
-                isCancel: true
-            }
-        };
-
+        const notif = this.notifications.get(notificationId);
+        if (notif) {
+            this.dismissedSignatures.set(notificationId, `${notif.title}|${notif.text}`);
+        }
         this.notifications.delete(notificationId);
-        console.log(`[NotificationPlugin] Dismissing notification ${notificationId} on ${device.info.name}`);
-        return device.sendPacket(dismissPacket);
+
+        if (device) {
+            const dismissPacket = {
+                id: Date.now(),
+                type: 'kdeconnect.notification',
+                body: {
+                    id: notificationId,
+                    isCancel: true
+                }
+            };
+            console.log(`[NotificationPlugin] Dismissing notification ${notificationId} on ${device.info.name}`);
+            return device.sendPacket(dismissPacket);
+        }
+        return true;
+    }
+
+    clearAllNotifications(device) {
+        for (const [notifId, notif] of this.notifications.entries()) {
+            this.dismissedSignatures.set(notifId, `${notif.title}|${notif.text}`);
+            if (device) {
+                const dismissPacket = {
+                    id: Date.now(),
+                    type: 'kdeconnect.notification',
+                    body: { id: notifId, isCancel: true }
+                };
+                device.sendPacket(dismissPacket);
+            }
+        }
+        this.notifications.clear();
     }
 
     requestAllNotifications(device) {

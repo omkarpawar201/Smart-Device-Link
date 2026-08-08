@@ -1,48 +1,28 @@
-import React, { useState, useEffect } from 'react';
-import { Bell, Send, Trash2, CheckCircle2, MessageSquare, Smartphone } from 'lucide-react';
+import React, { useState } from 'react';
+import { Send, Trash2, CheckCircle2, Smartphone } from 'lucide-react';
+import refreshIcon from './icons/refresh_icon.gif';
 
-export default function Notifications({ device }) {
-    const [notifications, setNotifications] = useState([
-        // Initial sample mirrored notifications (live stream bound via IPC)
-        {
-            id: 'demo_1',
-            appName: 'WhatsApp',
-            title: 'Alex Rivera',
-            text: 'Are we still meeting for coffee at 4 PM?',
-            time: Date.now() - 1000 * 60 * 3,
-            requestReplyId: 'reply_whatsapp_1',
-            isClearable: true
-        },
-        {
-            id: 'demo_2',
-            appName: 'Gmail',
-            title: 'GitHub Security',
-            text: 'New login from Chrome on Windows in New York, USA',
-            time: Date.now() - 1000 * 60 * 15,
-            requestReplyId: null,
-            isClearable: true
-        },
-        {
-            id: 'demo_3',
-            appName: 'Messages',
-            title: 'Bank Alert',
-            text: 'Your card ending in 4092 was charged $12.50 at Coffee Shop.',
-            time: Date.now() - 1000 * 60 * 42,
-            requestReplyId: 'reply_sms_2',
-            isClearable: true
-        }
-    ]);
-
+export default function Notifications({ device, notifications = [], setNotifications }) {
     const [replyInputs, setReplyInputs] = useState({});
+    const [isRefreshing, setIsRefreshing] = useState(false);
 
-    useEffect(() => {
-        // Listen for live mirrored notifications from Electron main process
-        if (window.api && window.api.onNotificationReceived) {
-            window.api.onNotificationReceived((newNotif) => {
-                setNotifications((prev) => [newNotif, ...prev.filter((n) => n.id !== newNotif.id)]);
-            });
+    const fetchNotifications = () => {
+        setIsRefreshing(true);
+        if (window.api && typeof window.api.invoke === 'function') {
+            const res = window.api.invoke('get-notifications');
+            if (res && typeof res.then === 'function') {
+                res.then((list) => {
+                    if (Array.isArray(list)) setNotifications(list);
+                })
+                    .catch((err) => console.error(err))
+                    .finally(() => {
+                        setTimeout(() => setIsRefreshing(false), 750);
+                    });
+                return;
+            }
         }
-    }, []);
+        setTimeout(() => setIsRefreshing(false), 750);
+    };
 
     const handleReplyChange = (id, text) => {
         setReplyInputs((prev) => ({ ...prev, [id]: text }));
@@ -57,7 +37,6 @@ export default function Notifications({ device }) {
         }
 
         setReplyInputs((prev) => ({ ...prev, [id]: '' }));
-        // Append feedback badge or auto-dismiss
     };
 
     const handleDismiss = (id) => {
@@ -67,7 +46,15 @@ export default function Notifications({ device }) {
         setNotifications((prev) => prev.filter((n) => n.id !== id));
     };
 
+    const handleClearFeed = () => {
+        setNotifications([]);
+        if (window.api && window.api.send) {
+            window.api.send('clear-all-notifications');
+        }
+    };
+
     const formatTime = (ts) => {
+        if (!ts) return 'Just now';
         const mins = Math.floor((Date.now() - ts) / (1000 * 60));
         if (mins < 1) return 'Just now';
         if (mins < 60) return `${mins}m ago`;
@@ -76,27 +63,27 @@ export default function Notifications({ device }) {
 
     return (
         <div className="animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '20px', maxWidth: '850px' }}>
-            {/* Header Bar */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div>
                     <h2 style={{ fontSize: '20px', fontWeight: 700, color: 'var(--text-primary)' }}>Notification Center</h2>
                     <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                        Mirrored in real-time from {device?.name || 'your Android device'}.
+                        Live notifications from {device?.name || 'your phone'}.
                     </p>
                 </div>
 
-                {notifications.length > 0 && (
-                    <button
-                        className="btn-secondary"
-                        onClick={() => setNotifications([])}
-                        style={{ fontSize: '12px', padding: '6px 12px' }}
-                    >
-                        Clear All ({notifications.length})
+                <div style={{ display: 'flex', gap: '10px' }}>
+                    <button className="btn-secondary" onClick={fetchNotifications} disabled={isRefreshing} style={{ fontSize: '12px', padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <img src={refreshIcon} alt="Refresh" style={{ width: '16px', height: '16px', objectFit: 'contain' }} />
+                        <span>{isRefreshing ? 'Refreshing...' : 'Refresh Sync'}</span>
                     </button>
-                )}
+                    {notifications.length > 0 && (
+                        <button className="btn-secondary" onClick={handleClearFeed} style={{ fontSize: '12px', padding: '6px 12px' }}>
+                            Clear Feed ({notifications.length})
+                        </button>
+                    )}
+                </div>
             </div>
 
-            {/* Notifications Feed */}
             {notifications.length === 0 ? (
                 <div
                     className="glass-panel"
@@ -143,7 +130,6 @@ export default function Notifications({ device }) {
                                 borderLeft: '3px solid var(--accent-cyan)'
                             }}
                         >
-                            {/* Card Top Row: App & Actions */}
                             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                     <div
@@ -173,19 +159,15 @@ export default function Notifications({ device }) {
                                             border: 'none',
                                             color: 'var(--text-muted)',
                                             cursor: 'pointer',
-                                            padding: '4px',
-                                            borderRadius: 'var(--radius-sm)'
+                                            padding: '4px'
                                         }}
-                                        onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent-rose)')}
-                                        onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
-                                        title="Dismiss notification"
+                                        title="Dismiss notification on phone"
                                     >
                                         <Trash2 size={15} />
                                     </button>
                                 )}
                             </div>
 
-                            {/* Title & Body Text */}
                             <div>
                                 <div style={{ fontWeight: 600, fontSize: '14px', color: 'var(--text-primary)' }}>{notif.title}</div>
                                 <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '2px', lineHeight: 1.4 }}>
@@ -193,7 +175,6 @@ export default function Notifications({ device }) {
                                 </div>
                             </div>
 
-                            {/* Inline Quick Reply Box if supported */}
                             {notif.requestReplyId && (
                                 <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
                                     <input

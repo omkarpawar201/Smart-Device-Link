@@ -7,7 +7,6 @@ import ViewContainer from './components/ViewContainer';
 export default function App() {
     const [activeTab, setActiveTab] = useState('notifications');
 
-    // Simulated initial device state (will be bound to real KDE Connect IPC in Phase 2)
     const [deviceState, setDeviceState] = useState({
         name: 'No Device Connected',
         connected: false,
@@ -19,34 +18,56 @@ export default function App() {
         bluetooth: false
     });
 
+    const [notifications, setNotifications] = useState([]);
 
     useEffect(() => {
-        // Listen for IPC device status updates if window.api is available
+        // Device status listener
         if (window.api && window.api.onDeviceStatusChanged) {
             window.api.onDeviceStatusChanged((newStatus) => {
                 setDeviceState((prev) => ({ ...prev, ...newStatus }));
+            });
+        }
+
+        // Notification IPC sync & listeners
+        if (window.api && typeof window.api.invoke === 'function') {
+            const res = window.api.invoke('get-notifications');
+            if (res && typeof res.then === 'function') {
+                res.then((list) => {
+                    if (Array.isArray(list)) setNotifications(list);
+                }).catch((err) => console.error(err));
+            }
+        }
+
+        if (window.api && window.api.onNotificationReceived) {
+            window.api.onNotificationReceived((newNotif) => {
+                setNotifications((prev) => [newNotif, ...prev.filter((n) => n.id !== newNotif.id)]);
+            });
+        }
+
+        if (window.api && window.api.onNotificationDismissed) {
+            window.api.onNotificationDismissed(({ id }) => {
+                setNotifications((prev) => prev.filter((n) => n.id !== id));
             });
         }
     }, []);
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw', overflow: 'hidden' }}>
-            {/* Top Custom Window Title Bar */}
             <Titlebar />
 
-            {/* Main Glassmorphic Application Dashboard */}
             <div style={{ display: 'flex', flex: 1, overflow: 'hidden', position: 'relative' }}>
-                {/* Left Navigation Sidebar */}
-                <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
+                <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} notificationCount={notifications.length} />
 
-                {/* Content Area */}
                 <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', background: 'var(--bg-dark)' }}>
-                    {/* Header Bar with Live Device Status */}
                     <DeviceStatus device={deviceState} />
 
-                    {/* Active Tab View Body */}
                     <main style={{ flex: 1, padding: '20px', overflowY: 'auto' }}>
-                        <ViewContainer activeTab={activeTab} device={deviceState} />
+                        <ViewContainer
+                            activeTab={activeTab}
+                            device={deviceState}
+                            notifications={notifications}
+                            setNotifications={setNotifications}
+                        />
                     </main>
                 </div>
             </div>

@@ -1,5 +1,8 @@
 import React from 'react';
+import Notifications from './Notifications';
+import Messages from './Messages';
 import Settings from './Settings';
+
 import {
     Bell,
     MessageSquare,
@@ -14,13 +17,12 @@ import {
     Bot
 } from 'lucide-react';
 
-export default function ViewContainer({ activeTab, device }) {
-    if (activeTab === 'settings') {
-        return <Settings device={device} />;
-    }
+export default function ViewContainer({ activeTab, device, notifications, setNotifications }) {
+    if (activeTab === 'notifications') return <Notifications device={device} notifications={notifications} setNotifications={setNotifications} />;
+    if (activeTab === 'messages') return <Messages device={device} />;
+    if (activeTab === 'settings') return <Settings device={device} />;
 
-    const tabDetails = {
-        notifications: { title: 'Notifications', icon: Bell, color: 'var(--accent-cyan)', desc: 'Real-time phone notifications listener & quick reply bridge' },
+    const placeholderTabs = {
         messages: { title: 'SMS Messages', icon: MessageSquare, color: 'var(--accent-blue)', desc: 'Bi-directional SMS/MMS conversation threads & composer' },
         calls: { title: 'Phone Calls', icon: PhoneCall, color: 'var(--accent-emerald)', desc: 'Bluetooth HFP phone calls dialer & real-time audio routing' },
         contacts: { title: 'Contacts', icon: Users, color: 'var(--accent-cyan)', desc: 'Phone contacts directory & quick dial action' },
@@ -33,7 +35,7 @@ export default function ViewContainer({ activeTab, device }) {
         ai: { title: 'AI Assistant', icon: Bot, color: 'var(--accent-violet)', desc: 'Gemini-powered notification summaries, smart replies & OCR' }
     };
 
-    const current = tabDetails[activeTab] || tabDetails.notifications;
+    const current = placeholderTabs[activeTab] || placeholderTabs.messages;
     const Icon = current.icon;
 
     return (
