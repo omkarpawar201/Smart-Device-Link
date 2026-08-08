@@ -107,16 +107,49 @@ function initKDEConnectBridge(mainWindow) {
     deviceManager.startDiscovery();
 
     // Forward Discovered Devices to UI
+    const outboundRetryWindow = new Map(); // deviceId -> last outbound attempt (ms)
+
+    const autoConnectPairedDevice = (deviceInfo) => {
+        if (!deviceInfo || !deviceInfo.id) return;
+        if (pairingManager.isPaired(deviceInfo.id) !== true) return;
+        if (activeDeviceConnections.has(deviceInfo.id)) return;
+
+        // Nudge the phone to open a connection to us: the phone's udpPacketReceived
+        // reacts to ANY identity packet (broadcast or unicast). A unicast to its IP
+        // is more reliable than a subnet broadcast, which some routers drop.
+        if (deviceManager.sendIdentityToIp) {
+            deviceManager.sendIdentityToIp(deviceInfo.ip);
+        }
+
+        // The phone normally connects to us on its own whenever it receives our
+        // UDP broadcast. Give it a moment to do that before we try the outbound
+        // fallback, and never retry outbound more often than every 10s.
+        const lastAttempt = outboundRetryWindow.get(deviceInfo.id) || 0;
+        if (Date.now() - lastAttempt < 10000) return;
+        outboundRetryWindow.set(deviceInfo.id, Date.now());
+
+        setTimeout(() => {
+            if (activeDeviceConnections.has(deviceInfo.id)) return;
+            const latest = deviceManager.discoveredDevices.get(deviceInfo.id);
+            if (!latest) return;
+            console.log(`[Bridge] Connecting to paired device ${latest.name}...`);
+            connectToDevice(latest, currentMainWindow);
+        }, 3000);
+    };
+
     deviceManager.on('deviceDiscovered', (deviceInfo) => {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) {
             currentMainWindow.webContents.send('discovered-devices-changed', deviceManager.getDiscoveredDevices());
         }
+        autoConnectPairedDevice(deviceInfo);
+    });
 
-        // Only auto-connect to devices that are ALREADY paired
-        if (deviceInfo && deviceInfo.id && pairingManager.isPaired(deviceInfo.id) === true && !activeDeviceConnections.has(deviceInfo.id)) {
-            console.log(`[Bridge] Connecting to paired device ${deviceInfo.name}...`);
-            connectToDevice(deviceInfo, currentMainWindow);
-        }
+    // Self-heal reconnects: after a disconnect (e.g. Wi-Fi drop), the phone keeps
+    // broadcasting its identity over UDP. Whenever we hear from a paired device
+    // that isn't connected, actively re-establish the link instead of waiting
+    // passively for the phone to connect to us.
+    deviceManager.on('deviceUpdated', (deviceInfo) => {
+        autoConnectPairedDevice(deviceInfo);
     });
 
 
@@ -140,12 +173,24 @@ function initKDEConnectBridge(mainWindow) {
             tempDev.socket = null;
             tempDev.buffer = '';
 
-            // Clean up old socket listeners BEFORE destroying to prevent false disconnect events
+            // Detach the old socket gracefully. Do NOT use an abrupt destroy() here:
+            // the phone reconnects rapidly (link.reset churn) and often reuses the
+            // same TCP source port, so an RST/FIN from closing the stale socket can
+            // corrupt the fresh connection. end() flushes and sends FIN; a destroy()
+            // fallback guarantees the fd is freed even if the peer never ACKs.
             if (oldSocket) {
-                oldSocket.removeAllListeners('data');
-                oldSocket.removeAllListeners('close');
-                oldSocket.removeAllListeners('error');
-                oldSocket.destroy();
+                // Strip EVERY listener (data, close, error, end, timeout, secure):
+                // a late 'end'/'timeout' on this dying socket must not call
+                // handleDisconnect, which would destroy the freshly attached socket.
+                oldSocket.removeAllListeners();
+                oldSocket.on('error', () => {}); // swallow late teardown errors
+                const teardownTimer = setTimeout(() => oldSocket.destroy(), 1000);
+                oldSocket.once('close', () => clearTimeout(teardownTimer));
+                try {
+                    oldSocket.end();
+                } catch (e) {
+                    oldSocket.destroy();
+                }
             }
             tempDev.info.ip = tlsSocket.remoteAddress;
             tempDev.info.name = deviceName;
@@ -196,6 +241,7 @@ function initKDEConnectBridge(mainWindow) {
         tempDev.socket = tlsSocket;
         tempDev.connected = true;
         tempDev.lastPacketAt = Date.now();
+        tempDev.cancelPendingDisconnect();
         tempDev.startHeartbeat();
 
         tlsSocket.setKeepAlive(true, 3000);
@@ -505,6 +551,12 @@ function connectToDevice(deviceInfo, mainWindow) {
 
     deviceConnection.on('packet', (packet) => {
         packetRouter.routePacket(deviceConnection, packet);
+    });
+
+    deviceConnection.on('connectfailed', () => {
+        // A failed connect attempt must not leave a dead placeholder in the map,
+        // otherwise auto-connect sees it and never retries.
+        activeDeviceConnections.delete(deviceInfo.id);
     });
 
     deviceConnection.on('disconnected', ({ info }) => {

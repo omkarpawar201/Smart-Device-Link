@@ -23,10 +23,24 @@ class Device extends EventEmitter {
         const rawSocket = net.connect({
             host: this.info.ip,
             port: this.info.port || 1716,
-            timeout: 5000
+            timeout: 3000
         });
 
         const onRawConnect = () => {
+            // The connect-phase handlers below are only relevant during the attempt;
+            // once connected, the TLS socket takes over error/timeout handling.
+            rawSocket.removeAllListeners('timeout');
+            rawSocket.removeAllListeners('error');
+
+            // If a replacement socket was already attached (e.g. the phone connected
+            // to us while our outbound connect was still in flight), abandon this
+            // outbound connection instead of clobbering the live one.
+            if (this.socket) {
+                console.warn(`[Device] ${this.info.name}: outbound connect superseded by an incoming connection, aborting.`);
+                rawSocket.destroy();
+                return;
+            }
+
             // Connection established; the idle timeout was only needed for the connect attempt.
             // Liveness is now handled by the application-level heartbeat watchdog.
             rawSocket.setTimeout(0);
@@ -94,14 +108,28 @@ class Device extends EventEmitter {
 
         rawSocket.on('connect', onRawConnect);
 
+        // Any timeout/error before 'connect' fires means the attempt itself failed.
+        // Emit 'connectfailed' so the bridge can drop the placeholder from its map;
+        // otherwise a failed connect would sit there forever and block future
+        // auto-reconnect attempts.
+        let connectAttemptFailed = false;
+        const failConnect = (message) => {
+            if (connectAttemptFailed) return;
+            connectAttemptFailed = true;
+            this.handleDisconnect(message);
+            this.emit('connectfailed', this.info);
+            rawSocket.removeAllListeners();
+            rawSocket.destroy();
+        };
+
         rawSocket.on('timeout', () => {
             console.warn(`[Device Timeout] Connection to ${this.info.name} (${this.info.ip}) timed out.`);
-            this.handleDisconnect('Socket timeout');
+            failConnect('Socket timeout');
         });
 
         rawSocket.on('error', (err) => {
             console.error(`[Device Connection Failure] ${this.info.name}:`, err.message);
-            this.handleDisconnect(err.message);
+            failConnect(err.message);
         });
     }
 
@@ -145,6 +173,8 @@ class Device extends EventEmitter {
     }
 
     handleDisconnect(reason) {
+        if (this.pendingDisconnect) return;
+
         const wasConnected = this.connected;
         this.connected = false;
         this.lastPacketAt = 0;
@@ -155,9 +185,23 @@ class Device extends EventEmitter {
             this.socket = null;
         }
 
-        if (wasConnected) {
+        if (!wasConnected) return;
+
+        // Grace period: the phone often swaps to a fresh connection immediately
+        // (LanLink.link.reset churn on every UDP broadcast). If a replacement
+        // socket is attached before the timer fires, the disconnect is cancelled
+        // and the link is reused seamlessly instead of flickering the UI.
+        this.pendingDisconnect = setTimeout(() => {
+            this.pendingDisconnect = null;
             console.log(`[Device] Disconnected from ${this.info.name}. Reason: ${reason}`);
             this.emit('disconnected', { info: this.info, reason });
+        }, 600);
+    }
+
+    cancelPendingDisconnect() {
+        if (this.pendingDisconnect) {
+            clearTimeout(this.pendingDisconnect);
+            this.pendingDisconnect = null;
         }
     }
 
