@@ -49,6 +49,13 @@ export default function Settings({ device }) {
         }
     };
 
+    const handleUnpair = (deviceId) => {
+        if (window.api && window.api.invoke) {
+            window.api.invoke('unpair-device', deviceId);
+        }
+    };
+
+
     const handleAcceptPair = () => {
         if (pairingRequest && window.api && window.api.invoke) {
             window.api.invoke('accept-pair', pairingRequest.device.id);
@@ -167,12 +174,16 @@ export default function Settings({ device }) {
                                                 {dev.isConnected ? 'Paired & Connected' : 'Paired (Offline)'}
                                             </span>
                                         </div>
+                                        <button className="btn-secondary" onClick={() => handleUnpair(dev.id)} style={{ padding: '6px 12px', fontSize: '12px' }}>
+                                            Unpair
+                                        </button>
                                     </div>
                                 ) : (
                                     <button className="btn-primary" onClick={() => handlePair(dev.id)} style={{ padding: '8px 16px', fontSize: '13px' }}>
                                         Pair Device
                                     </button>
                                 )}
+
                             </div>
                         ))}
                     </div>

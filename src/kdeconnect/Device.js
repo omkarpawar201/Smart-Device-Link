@@ -12,6 +12,7 @@ class Device extends EventEmitter {
         this.crypto = cryptoHelper;
         this.socket = null;
         this.connected = false;
+        this.isPaired = false;
         this.buffer = '';
         this.lastPacketAt = 0;
         this.heartbeatInterval = null;
@@ -214,11 +215,16 @@ class Device extends EventEmitter {
         this.heartbeatInterval = setInterval(() => {
             if (!this.connected) return;
 
-            const idleMs = Date.now() - this.lastPacketAt;
-            if (idleMs > HEARTBEAT_TIMEOUT_MS) {
-                console.warn(`[Device] ${this.info.name} has not responded for ${Math.round(idleMs / 1000)}s; declaring disconnected.`);
-                this.handleDisconnect('Heartbeat timeout (no response from device)');
-                return;
+            // Unpaired devices never answer plugin pings (the phone only routes
+            // plugin packets to paired peers), so a timeout here would falsely
+            // kill the link during pairing. Let socket-level events handle it.
+            if (this.isPaired) {
+                const idleMs = Date.now() - this.lastPacketAt;
+                if (idleMs > HEARTBEAT_TIMEOUT_MS) {
+                    console.warn(`[Device] ${this.info.name} has not responded for ${Math.round(idleMs / 1000)}s; declaring disconnected.`);
+                    this.handleDisconnect('Heartbeat timeout (no response from device)');
+                    return;
+                }
             }
 
             this.sendPing();
@@ -233,9 +239,12 @@ class Device extends EventEmitter {
     }
 
     sendPing() {
+        // kdeconnect.connectivity_report.request is deprecated and ignored by
+        // modern Android; the phone's stable BatteryPlugin still answers
+        // kdeconnect.battery.request with a kdeconnect.battery report.
         const pingPacket = {
             id: Date.now(),
-            type: 'kdeconnect.connectivity_report.request',
+            type: 'kdeconnect.battery.request',
             body: { request: true }
         };
         this.sendPacket(pingPacket);

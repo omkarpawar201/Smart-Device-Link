@@ -183,7 +183,7 @@ function initKDEConnectBridge(mainWindow) {
                 // a late 'end'/'timeout' on this dying socket must not call
                 // handleDisconnect, which would destroy the freshly attached socket.
                 oldSocket.removeAllListeners();
-                oldSocket.on('error', () => {}); // swallow late teardown errors
+                oldSocket.on('error', () => { }); // swallow late teardown errors
                 const teardownTimer = setTimeout(() => oldSocket.destroy(), 1000);
                 oldSocket.once('close', () => clearTimeout(teardownTimer));
                 try {
@@ -241,6 +241,7 @@ function initKDEConnectBridge(mainWindow) {
         tempDev.socket = tlsSocket;
         tempDev.connected = true;
         tempDev.lastPacketAt = Date.now();
+        tempDev.isPaired = pairingManager.isPaired(deviceId);
         tempDev.cancelPendingDisconnect();
         tempDev.startHeartbeat();
 
@@ -296,6 +297,27 @@ function initKDEConnectBridge(mainWindow) {
             currentMainWindow.webContents.send('pairing-requested', data);
         }
     });
+
+    // Keep each connection's heartbeat pairing-aware: the phone only answers
+    // plugin pings (battery.request) once paired, so isPaired gates the timeout.
+    pairingManager.on('devicePaired', (data) => {
+        const dev = activeDeviceConnections.get(data.id);
+        if (dev) dev.isPaired = true;
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('discovered-devices-changed', enrichDiscoveredDevices(deviceManager.getDiscoveredDevices()));
+            currentMainWindow.webContents.send('device-status-changed', { isPaired: true });
+        }
+    });
+
+    pairingManager.on('deviceUnpaired', (data) => {
+        const dev = activeDeviceConnections.get(data.id);
+        if (dev) dev.isPaired = false;
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('discovered-devices-changed', enrichDiscoveredDevices(deviceManager.getDiscoveredDevices()));
+            currentMainWindow.webContents.send('device-status-changed', { isPaired: false });
+        }
+    });
+
 
     // Forward Plugin Events to React Renderer
     pluginEvents.on('notificationReceived', (data) => {
@@ -522,6 +544,7 @@ function connectToDevice(deviceInfo, mainWindow) {
     }
 
     const deviceConnection = new Device(deviceInfo, cryptoHelper);
+    deviceConnection.isPaired = pairingManager.isPaired(deviceInfo.id);
     activeDeviceConnections.set(deviceInfo.id, deviceConnection);
 
     deviceConnection.on('connected', (info) => {
