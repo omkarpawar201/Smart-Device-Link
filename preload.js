@@ -12,6 +12,12 @@ contextBridge.exposeInMainWorld('api', {
     onDeviceStatusChanged: (callback) => {
         ipcRenderer.on('device-status-changed', (event, data) => callback(data));
     },
+    onDiscoveredDevicesChanged: (callback) => {
+        ipcRenderer.on('discovered-devices-changed', (event, data) => callback(data));
+    },
+    onPairingRequested: (callback) => {
+        ipcRenderer.on('pairing-requested', (event, data) => callback(data));
+    },
     onNotificationReceived: (callback) => {
         ipcRenderer.on('notification-received', (event, data) => callback(data));
     },
@@ -50,15 +56,23 @@ contextBridge.exposeInMainWorld('api', {
             'upload-file',
             'delete-file',
             'scan-photos',
-            'answer-call',
-            'decline-call'
+            'answer-call-audio',
+            'hangup-call-audio',
+            'toggle-mute-audio',
+            'transfer-call-audio'
         ];
         if (validChannels.includes(channel)) {
             ipcRenderer.send(channel, data);
         }
     },
     invoke: (channel, data) => {
-        const validChannels = ['get-discovered-devices', 'pair-device', 'accept-pair', 'unpair-device', 'fetch-files'];
+        const validChannels = [
+            'get-discovered-devices',
+            'pair-device',
+            'accept-pair',
+            'unpair-device',
+            'fetch-files'
+        ];
         if (validChannels.includes(channel)) {
             return ipcRenderer.invoke(channel, data);
         }

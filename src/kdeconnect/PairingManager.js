@@ -11,6 +11,10 @@ class PairingManager extends EventEmitter {
         this.pairedFilePath = path.join(os.homedir(), '.smart_device_link_keys', 'paired_devices.json');
         this.pairedDevices = new Map(); // deviceId -> { id, name, certFingerprint, pairedAt }
 
+        // Tracks in-progress pairing handshakes so we know whether an incoming
+        // pair packet is a reply to a request we initiated or a brand-new request.
+        this.pendingPairs = new Map(); // deviceId -> { direction: 'outgoing'|'incoming', timestamp }
+
         this.loadPairedDevices();
         this.registerPairingHandler();
     }
@@ -38,77 +42,131 @@ class PairingManager extends EventEmitter {
     }
 
     isPaired(deviceId) {
+        if (!deviceId) return false;
         return this.pairedDevices.has(deviceId);
+    }
+
+    // Protocol v8 requires a unix-seconds timestamp in pair packets. Without it
+    // the Android PairingHandler treats an incoming request as an unpair.
+    makePairPacket(pair) {
+        return {
+            id: Date.now(),
+            type: 'kdeconnect.pair',
+            body: {
+                pair,
+                timestamp: Math.floor(Date.now() / 1000)
+            }
+        };
     }
 
     registerPairingHandler() {
         this.router.on('packet:kdeconnect.pair', ({ device, packet }) => {
-            const isPairRequest = packet.body && packet.body.pair === true;
-            const isUnpairRequest = packet.body && packet.body.pair === false;
+            const body = packet.body || {};
+            const wantsPair = body.pair;
 
-            console.log(`[PairingManager] Received pair packet from ${device.info.name} (pair: ${packet.body.pair})`);
+            console.log(`[PairingManager] Received pair packet from ${device.info.name} (pair: ${wantsPair})`);
 
-            if (isPairRequest) {
-                if (this.isPaired(device.info.id)) {
-                    // Already paired, send confirmation pair packet back
+            if (wantsPair) {
+                const deviceId = device.info.id;
+                const pending = this.pendingPairs.get(deviceId);
+
+                if (pending && pending.direction === 'outgoing') {
+                    // We initiated pairing and the remote device accepted.
+                    console.log(`[PairingManager] ${device.info.name} accepted our pair request.`);
+                    this.acceptPair(device);
+                } else if (this.isPaired(deviceId)) {
+                    // Already paired: respond to keep both sides in sync.
                     this.acceptPair(device);
                 } else {
-                    // Emit incoming pair request prompt to UI
+                    // Brand-new incoming pair request: show the user a prompt.
+                    this.pendingPairs.set(deviceId, {
+                        direction: 'incoming',
+                        timestamp: body.timestamp || null
+                    });
                     this.emit('pairingRequested', {
                         device: device.info,
                         requestId: packet.id
                     });
                 }
-            } else if (isUnpairRequest) {
-                this.unpair(device.info.id);
-                this.emit('deviceUnpaired', device.info);
+            } else {
+                // Unpair request
+                const deviceId = device.info.id;
+                this.pendingPairs.delete(deviceId);
+                if (this.isPaired(deviceId)) {
+                    this.unpair(deviceId);
+                    this.emit('deviceUnpaired', device.info);
+                } else {
+                    console.log(`[PairingManager] Ignoring unpair request for already unpaired device ${device.info.name}`);
+                }
             }
         });
     }
 
     requestPair(device) {
+        if (!device || !device.info.id) return;
+
+        const deviceId = device.info.id;
+        if (this.isPaired(deviceId)) {
+            console.log(`[PairingManager] requestPair called for already paired device ${device.info.name}`);
+            return;
+        }
+
+        const pending = this.pendingPairs.get(deviceId);
+        if (pending && pending.direction === 'incoming') {
+            // The remote device already asked us: accept their request instead.
+            console.log(`[PairingManager] ${device.info.name} already requested pairing, accepting their request.`);
+            this.acceptPair(device);
+            return;
+        }
+
         console.log(`[PairingManager] Sending pair request to ${device.info.name}...`);
-        const pairPacket = {
-            id: Date.now(),
-            type: 'kdeconnect.pair',
-            body: { pair: true }
-        };
-        device.sendPacket(pairPacket);
+        this.pendingPairs.set(deviceId, {
+            direction: 'outgoing',
+            timestamp: Math.floor(Date.now() / 1000)
+        });
+        device.sendPacket(this.makePairPacket(true));
     }
 
     acceptPair(device) {
-        console.log(`[PairingManager] Accepting pair request from ${device.info.name}...`);
+        if (!device || !device.info.id) return;
 
-        // Save device as paired
-        const pairedData = {
-            id: device.info.id,
+        const deviceId = device.info.id;
+        this.pendingPairs.delete(deviceId);
+
+        // Verify remote certificate and save to trust store
+        if (device.socket && typeof device.socket.getPeerCertificate === 'function') {
+            const certResult = this.crypto.verifyPeerCertificate(device.socket, deviceId);
+            if (certResult.valid) {
+                device.info.certificatePem = certResult.certPem;
+                device.info.fingerprint = certResult.fingerprint;
+                console.log(`[PairingManager] Verified & Saved peer certificate for ${device.info.name} (${certResult.fingerprint})`);
+            }
+        }
+
+        const pairedDevice = {
+            id: deviceId,
             name: device.info.name,
             ip: device.info.ip,
-            pairedAt: new Date().toISOString()
+            pairedAt: Date.now(),
+            fingerprint: device.info.fingerprint || null,
+            certificatePem: device.info.certificatePem || null
         };
 
-        this.pairedDevices.set(device.info.id, pairedData);
+        this.pairedDevices.set(deviceId, pairedDevice);
         this.savePairedDevices();
 
-        // Send accept packet
-        const acceptPacket = {
-            id: Date.now(),
-            type: 'kdeconnect.pair',
-            body: { pair: true }
-        };
-        device.sendPacket(acceptPacket);
+        // Send pair accept packet
+        device.sendPacket(this.makePairPacket(true));
 
-        this.emit('devicePaired', pairedData);
+        console.log(`[PairingManager] Paired successfully with ${device.info.name}`);
+        this.emit('devicePaired', pairedDevice);
     }
 
     rejectPair(device) {
+        if (!device || !device.info.id) return;
         console.log(`[PairingManager] Rejecting pair request from ${device.info.name}...`);
-        const rejectPacket = {
-            id: Date.now(),
-            type: 'kdeconnect.pair',
-            body: { pair: false }
-        };
-        device.sendPacket(rejectPacket);
+        this.pendingPairs.delete(device.info.id);
+        device.sendPacket(this.makePairPacket(false));
     }
 
     unpair(deviceId) {

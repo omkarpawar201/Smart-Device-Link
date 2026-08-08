@@ -1,8 +1,10 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
+const { initKDEConnectBridge, setMainWindow } = require('./src/ipc/bridge');
 
 let mainWindow = null;
 let tray = null;
+let bridgeInitialized = false;
 
 const isDev = process.env.NODE_ENV !== 'production';
 
@@ -24,6 +26,10 @@ function createWindow() {
         show: false
     });
 
+    if (bridgeInitialized && setMainWindow) {
+        setMainWindow(mainWindow);
+    }
+
     // Load URL
     if (isDev) {
         mainWindow.loadURL('http://localhost:5173');
@@ -40,6 +46,9 @@ function createWindow() {
     // Handle window closed
     mainWindow.on('closed', () => {
         mainWindow = null;
+        if (bridgeInitialized && setMainWindow) {
+            setMainWindow(null);
+        }
     });
 }
 
@@ -114,6 +123,8 @@ ipcMain.handle('get-app-version', () => app.getVersion());
 app.whenReady().then(() => {
     createWindow();
     createTray();
+    initKDEConnectBridge(mainWindow);
+    bridgeInitialized = true;
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) createWindow();
