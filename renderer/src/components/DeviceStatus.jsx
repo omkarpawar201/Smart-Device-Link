@@ -2,6 +2,12 @@ import React from 'react';
 import { Smartphone, BatteryCharging, Battery, Wifi, Bluetooth, Signal } from 'lucide-react';
 
 export default function DeviceStatus({ device }) {
+    const getStatusText = () => {
+        if (!device.connected) return 'Disconnected';
+        if (device.bluetooth) return 'Connected via Wi-Fi & Bluetooth';
+        return 'Connected via Wi-Fi';
+    };
+
     return (
         <header
             style={{
@@ -37,7 +43,7 @@ export default function DeviceStatus({ device }) {
                     <div className="status-pill" style={{ marginTop: '2px' }}>
                         <span className={`status-dot ${!device.connected ? 'disconnected' : ''}`} />
                         <span style={{ fontSize: '11px', color: device.connected ? 'var(--accent-emerald)' : 'var(--text-muted)' }}>
-                            {device.connected ? 'Connected via Wi-Fi & BT' : 'Disconnected'}
+                            {getStatusText()}
                         </span>
                     </div>
                 </div>
@@ -48,28 +54,32 @@ export default function DeviceStatus({ device }) {
                 {/* Battery Indicator */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--text-secondary)' }}>
                     {device.isCharging ? <BatteryCharging size={18} color="var(--accent-emerald)" /> : <Battery size={18} />}
-                    <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{device.battery}%</span>
+                    <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{device.battery || 0}%</span>
                 </div>
 
-                {/* Signal Strength */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--text-secondary)' }}>
-                    <Signal size={18} color={device.signal > 0 ? 'var(--accent-cyan)' : 'var(--text-muted)'} />
-                    <span style={{ fontSize: '12px' }}>5G</span>
+                {/* Cellular Signal & Dynamic Network Type (4G / 5G / LTE) */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-secondary)' }}>
+                    <Signal size={18} color={device.connected && device.signal > 0 ? 'var(--accent-cyan)' : 'var(--text-muted)'} />
+                    <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                        {device.connected ? (device.networkType || '4G') : 'Offline'}
+                    </span>
                 </div>
 
-                {/* Wi-Fi & Bluetooth Pills */}
+                {/* Wi-Fi & Bluetooth Active Pills */}
                 <div style={{ display: 'flex', gap: '6px' }}>
                     <div
+                        title={device.connected ? 'Connected over Wi-Fi' : 'Wi-Fi Disconnected'}
                         style={{
                             padding: '6px',
                             borderRadius: 'var(--radius-sm)',
-                            background: device.wifi ? 'rgba(56, 189, 248, 0.15)' : 'rgba(255, 255, 255, 0.05)',
-                            color: device.wifi ? 'var(--accent-cyan)' : 'var(--text-muted)'
+                            background: device.connected ? 'rgba(56, 189, 248, 0.15)' : 'rgba(255, 255, 255, 0.05)',
+                            color: device.connected ? 'var(--accent-cyan)' : 'var(--text-muted)'
                         }}
                     >
                         <Wifi size={16} />
                     </div>
                     <div
+                        title={device.bluetooth ? 'Bluetooth Connected (HFP Audio)' : 'Bluetooth Standby'}
                         style={{
                             padding: '6px',
                             borderRadius: 'var(--radius-sm)',

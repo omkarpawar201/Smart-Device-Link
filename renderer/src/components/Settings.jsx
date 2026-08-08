@@ -134,7 +134,7 @@ export default function Settings({ device }) {
                             <div
                                 key={dev.id}
                                 className="glass-card"
-                                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+                                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px' }}
                             >
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
                                     <div
@@ -142,11 +142,11 @@ export default function Settings({ device }) {
                                             width: '40px',
                                             height: '40px',
                                             borderRadius: '50%',
-                                            background: 'rgba(56, 189, 248, 0.15)',
+                                            background: dev.isConnected ? 'rgba(16, 185, 129, 0.15)' : 'rgba(56, 189, 248, 0.15)',
                                             display: 'flex',
                                             alignItems: 'center',
                                             justifyContent: 'center',
-                                            color: 'var(--accent-cyan)'
+                                            color: dev.isConnected ? 'var(--accent-emerald)' : 'var(--accent-cyan)'
                                         }}
                                     >
                                         <Smartphone size={20} />
@@ -159,9 +159,20 @@ export default function Settings({ device }) {
                                     </div>
                                 </div>
 
-                                <button className="btn-primary" onClick={() => handlePair(dev.id)} style={{ padding: '8px 16px', fontSize: '13px' }}>
-                                    Pair Device
-                                </button>
+                                {dev.isPaired ? (
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                        <div className="status-pill" style={{ background: 'rgba(16, 185, 129, 0.15)', border: '1px solid rgba(16, 185, 129, 0.3)', padding: '6px 12px', borderRadius: '20px' }}>
+                                            <CheckCircle size={14} color="var(--accent-emerald)" />
+                                            <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent-emerald)', marginLeft: '6px' }}>
+                                                {dev.isConnected ? 'Paired & Connected' : 'Paired (Offline)'}
+                                            </span>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <button className="btn-primary" onClick={() => handlePair(dev.id)} style={{ padding: '8px 16px', fontSize: '13px' }}>
+                                        Pair Device
+                                    </button>
+                                )}
                             </div>
                         ))}
                     </div>

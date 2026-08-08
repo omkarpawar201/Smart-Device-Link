@@ -19,9 +19,13 @@ class BatteryPlugin extends BasePlugin {
         if (packet.type === 'kdeconnect.battery') {
             const body = packet.body || {};
 
+            const isChargingVal = typeof body.isCharging === 'boolean'
+                ? body.isCharging
+                : Boolean(body.isCharging === 1 || body.isCharging === 'true');
+
             this.batteryState = {
-                charge: typeof body.currentCharge === 'number' ? body.currentCharge : this.batteryState.charge,
-                isCharging: typeof body.isCharging === 'boolean' ? body.isCharging : this.batteryState.isCharging,
+                charge: typeof body.currentCharge === 'number' ? body.currentCharge : (typeof body.thresholdEvent === 'number' ? body.thresholdEvent : this.batteryState.charge),
+                isCharging: isChargingVal,
                 thresholdEvent: body.thresholdEvent || 0,
                 updatedAt: Date.now()
             };
@@ -36,6 +40,7 @@ class BatteryPlugin extends BasePlugin {
             }
         }
     }
+
 
     requestBatteryStatus(device) {
         if (!device) return false;

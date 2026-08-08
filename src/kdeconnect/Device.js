@@ -2,6 +2,9 @@ const net = require('net');
 const tls = require('tls');
 const EventEmitter = require('events');
 
+const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_TIMEOUT_MS = 15000;
+
 class Device extends EventEmitter {
     constructor(deviceInfo, cryptoHelper) {
         super();
@@ -10,6 +13,8 @@ class Device extends EventEmitter {
         this.socket = null;
         this.connected = false;
         this.buffer = '';
+        this.lastPacketAt = 0;
+        this.heartbeatInterval = null;
     }
 
     connect() {
@@ -22,6 +27,10 @@ class Device extends EventEmitter {
         });
 
         const onRawConnect = () => {
+            // Connection established; the idle timeout was only needed for the connect attempt.
+            // Liveness is now handled by the application-level heartbeat watchdog.
+            rawSocket.setTimeout(0);
+
             // KDE Connect: the device that INITIATES the TCP connection sends its identity in
             // plaintext first (with targetDeviceId / targetProtocolVersion), then performs the
             // TLS handshake as the TLS *server*. The receiving device performs the TLS *client*
@@ -50,11 +59,14 @@ class Device extends EventEmitter {
             }
 
             this.socket.setEncoding('utf8');
+            this.socket.setKeepAlive(true, 3000);
 
             this.socket.on('secure', () => {
                 this.connected = true;
+                this.lastPacketAt = Date.now();
                 console.log(`[Device] Encrypted TLS Connection Established with ${this.info.name}`);
                 this.emit('connected', this.info);
+                this.startHeartbeat();
             });
 
             this.socket.on('timeout', () => {
@@ -94,6 +106,7 @@ class Device extends EventEmitter {
     }
 
     handleRawData(data) {
+        this.lastPacketAt = Date.now();
         this.buffer += data;
 
         // KDE Connect protocol uses newline-delimited JSON packets
@@ -132,19 +145,56 @@ class Device extends EventEmitter {
     }
 
     handleDisconnect(reason) {
-        if (this.connected) {
-            this.connected = false;
-            console.log(`[Device] Disconnected from ${this.info.name}. Reason: ${reason}`);
-            this.emit('disconnected', { info: this.info, reason });
-        }
+        const wasConnected = this.connected;
+        this.connected = false;
+        this.lastPacketAt = 0;
+        this.stopHeartbeat();
+
         if (this.socket) {
             this.socket.destroy();
             this.socket = null;
+        }
+
+        if (wasConnected) {
+            console.log(`[Device] Disconnected from ${this.info.name}. Reason: ${reason}`);
+            this.emit('disconnected', { info: this.info, reason });
         }
     }
 
     disconnect() {
         this.handleDisconnect('User initiated disconnect');
+    }
+
+    startHeartbeat() {
+        this.stopHeartbeat();
+        this.heartbeatInterval = setInterval(() => {
+            if (!this.connected) return;
+
+            const idleMs = Date.now() - this.lastPacketAt;
+            if (idleMs > HEARTBEAT_TIMEOUT_MS) {
+                console.warn(`[Device] ${this.info.name} has not responded for ${Math.round(idleMs / 1000)}s; declaring disconnected.`);
+                this.handleDisconnect('Heartbeat timeout (no response from device)');
+                return;
+            }
+
+            this.sendPing();
+        }, HEARTBEAT_INTERVAL_MS);
+    }
+
+    stopHeartbeat() {
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
+        }
+    }
+
+    sendPing() {
+        const pingPacket = {
+            id: Date.now(),
+            type: 'kdeconnect.connectivity_report.request',
+            body: { request: true }
+        };
+        this.sendPacket(pingPacket);
     }
 }
 

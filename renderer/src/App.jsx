@@ -9,14 +9,16 @@ export default function App() {
 
     // Simulated initial device state (will be bound to real KDE Connect IPC in Phase 2)
     const [deviceState, setDeviceState] = useState({
-        name: 'Galaxy S23 Ultra',
-        connected: true,
-        battery: 82,
+        name: 'No Device Connected',
+        connected: false,
+        battery: 0,
         isCharging: false,
-        signal: 4, // 1 to 4 bars
-        wifi: true,
-        bluetooth: true
+        signal: 0,
+        networkType: 'Offline',
+        wifi: false,
+        bluetooth: false
     });
+
 
     useEffect(() => {
         // Listen for IPC device status updates if window.api is available

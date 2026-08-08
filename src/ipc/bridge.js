@@ -120,28 +120,27 @@ function initKDEConnectBridge(mainWindow) {
     });
 
 
-    // Handle incoming TLS connections initiated from phone
+    // Handle incoming connections initiated from phone
     deviceManager.on('incomingConnection', ({ tlsSocket, identityPacket }) => {
         const deviceId = identityPacket?.body?.deviceId;
-        const deviceName = identityPacket?.body?.deviceName || 'Phone';
-        console.log(`[Bridge] Incoming TLS Connection accepted from ${tlsSocket.remoteAddress} (${deviceName})`);
+        const deviceName = identityPacket?.body?.deviceName || 'Android Device';
 
         if (!deviceId) {
-            tlsSocket.destroy();
+            console.warn('[Bridge] Incoming TLS connection missing deviceId');
             return;
         }
+
+        console.log(`[Bridge] Incoming TLS Connection accepted from ${tlsSocket.remoteAddress} (${deviceName})`);
 
         let tempDev = activeDeviceConnections.get(deviceId);
 
         if (tempDev) {
-            // KDE Connect: the phone re-establishes its link every time it receives a
-            // UDP broadcast (LanLinkProvider.udpPacketReceived -> addOrUpdateLink ->
-            // link.reset). Reuse the existing Device instead of discarding plugin state.
             console.log(`[Bridge] Reusing connection for ${deviceName} (${deviceId})`);
             const oldSocket = tempDev.socket;
             tempDev.socket = null;
-            tempDev.connected = false;
             tempDev.buffer = '';
+
+            // Clean up old socket listeners BEFORE destroying to prevent false disconnect events
             if (oldSocket) {
                 oldSocket.removeAllListeners('data');
                 oldSocket.removeAllListeners('close');
@@ -175,9 +174,31 @@ function initKDEConnectBridge(mainWindow) {
             activeDeviceConnections.set(deviceId, tempDev);
         }
 
+        // Attach disconnect listener once per Device instance
+        if (!tempDev.hasDisconnectListener) {
+            tempDev.hasDisconnectListener = true;
+            tempDev.on('disconnected', () => {
+                console.log(`[Bridge] Device ${tempDev.info.name} disconnected.`);
+                activeDeviceConnections.delete(deviceId);
+                if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+                    currentMainWindow.webContents.send('device-status-changed', {
+                        connected: false,
+                        wifi: false,
+                        bluetooth: false,
+                        signal: 0,
+                        networkType: 'Offline'
+                    });
+                }
+            });
+        }
+
+        // Attach new socket & listeners
         tempDev.socket = tlsSocket;
         tempDev.connected = true;
+        tempDev.lastPacketAt = Date.now();
+        tempDev.startHeartbeat();
 
+        tlsSocket.setKeepAlive(true, 3000);
         tlsSocket.setEncoding('utf8');
         tlsSocket.on('data', (data) => tempDev.handleRawData(data));
         tlsSocket.on('close', () => tempDev.handleDisconnect('Socket closed'));
@@ -186,10 +207,42 @@ function initKDEConnectBridge(mainWindow) {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) {
             currentMainWindow.webContents.send('device-status-changed', {
                 name: tempDev.info.name,
-                connected: true
+                connected: true,
+                wifi: true,
+                isPaired: pairingManager.isPaired(deviceId)
             });
         }
+
+        // Request battery and connectivity reports immediately on connection
+        if (batteryPlugin) batteryPlugin.requestBatteryStatus(tempDev);
+        if (connectivityPlugin) connectivityPlugin.requestReport(tempDev);
     });
+
+
+    const enrichDiscoveredDevices = (devicesList) => {
+        if (!devicesList) return [];
+        return devicesList.map((dev) => ({
+            ...dev,
+            isPaired: pairingManager ? pairingManager.isPaired(dev.id) : false,
+            isConnected: activeDeviceConnections ? activeDeviceConnections.has(dev.id) : false
+        }));
+    };
+
+    // Forward Discovered Devices to UI with paired/connected flags
+    deviceManager.on('deviceDiscovered', () => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('discovered-devices-changed', enrichDiscoveredDevices(deviceManager.getDiscoveredDevices()));
+        }
+    });
+
+    ipcMain.handle('get-discovered-devices', () => {
+        if (deviceManager) {
+            deviceManager.sendIdentityBroadcast();
+            return enrichDiscoveredDevices(deviceManager.getDiscoveredDevices());
+        }
+        return [];
+    });
+
 
     // Pairing Manager Events
     pairingManager.on('pairingRequested', (data) => {
@@ -208,8 +261,14 @@ function initKDEConnectBridge(mainWindow) {
     });
 
     pluginEvents.on('connectivityStateChanged', (data) => {
-        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('device-status-changed', { signal: data.signalStrength });
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('device-status-changed', {
+                signal: data.signalStrength,
+                networkType: data.networkType || 'NA'
+            });
+        }
     });
+
 
     pluginEvents.on('clipboardReceived', (data) => {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('clipboard-received', data);
@@ -362,14 +421,6 @@ function initKDEConnectBridge(mainWindow) {
     ipcMain.on('ring-phone', () => {
         const activeDev = getFirstActiveDevice();
         if (activeDev) findMyPhonePlugin.ringPhone(activeDev);
-    });
-
-    ipcMain.handle('get-discovered-devices', () => {
-        if (deviceManager) {
-            deviceManager.sendIdentityBroadcast();
-            return deviceManager.getDiscoveredDevices();
-        }
-        return [];
     });
 
     ipcMain.handle('pair-device', (event, deviceId) => {

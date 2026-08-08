@@ -19,9 +19,11 @@ class ConnectivityPlugin extends BasePlugin {
         if (packet.type === 'kdeconnect.connectivity_report') {
             const body = packet.body || {};
 
+            const networkLabel = body.networkType || body.gsmNetworkType || '4G';
+
             this.connectivityState = {
                 signalStrength: typeof body.signalStrength === 'number' ? body.signalStrength : 4,
-                networkType: body.networkType || '5G',
+                networkType: networkLabel,
                 isRoaming: !!body.isRoaming,
                 updatedAt: Date.now()
             };
@@ -36,6 +38,7 @@ class ConnectivityPlugin extends BasePlugin {
             }
         }
     }
+
 
     requestReport(device) {
         if (!device) return false;
