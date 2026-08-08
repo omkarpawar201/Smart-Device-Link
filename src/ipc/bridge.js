@@ -1,4 +1,5 @@
-const { ipcMain, EventEmitter } = require('electron');
+const { ipcMain } = require('electron');
+const EventEmitter = require('events');
 const CryptoHelper = require('../kdeconnect/CryptoHelper');
 const DeviceManager = require('../kdeconnect/DeviceManager');
 const Device = require('../kdeconnect/Device');
@@ -23,11 +24,22 @@ const SharePlugin = require('../kdeconnect/plugins/SharePlugin');
 // Phase 5 Plugins
 const SftpPlugin = require('../kdeconnect/plugins/SftpPlugin');
 
+// Phase 6 Bluetooth HFP Engine & Audio Bridge
+const BluetoothManager = require('../bluetooth/BluetoothManager');
+const HfpProtocol = require('../bluetooth/HfpProtocol');
+const AudioBridge = require('../audio/AudioBridge');
+
 let cryptoHelper = null;
 let deviceManager = null;
 let packetRouter = null;
 let pairingManager = null;
 let activeDeviceConnections = new Map(); // deviceId -> Device instance
+let currentMainWindow = null;
+
+// Phase 6 Engine Instances
+let btManager = null;
+let hfpProtocol = null;
+let audioBridge = null;
 
 // Plugin Instances
 let notificationPlugin = null;
@@ -43,8 +55,13 @@ let contactsPlugin = null;
 let sharePlugin = null;
 let sftpPlugin = null;
 
+function setMainWindow(win) {
+    currentMainWindow = win;
+}
+
 function initKDEConnectBridge(mainWindow) {
-    console.log('[KDEConnect Bridge] Initializing Protocol Engine & Storage Plugins...');
+    currentMainWindow = mainWindow;
+    console.log('[KDEConnect Bridge] Initializing Protocol Engine & All Feature Plugins...');
 
     const pluginEvents = new EventEmitter();
 
@@ -52,6 +69,11 @@ function initKDEConnectBridge(mainWindow) {
     deviceManager = new DeviceManager(cryptoHelper);
     packetRouter = new PacketRouter();
     pairingManager = new PairingManager(packetRouter, cryptoHelper);
+
+    // Phase 6 Bluetooth & Audio Setup
+    btManager = new BluetoothManager();
+    hfpProtocol = new HfpProtocol(btManager);
+    audioBridge = new AudioBridge();
 
     // Instantiate Plugins
     notificationPlugin = new NotificationPlugin(pluginEvents);
@@ -86,54 +108,179 @@ function initKDEConnectBridge(mainWindow) {
 
     // Forward Discovered Devices to UI
     deviceManager.on('deviceDiscovered', (deviceInfo) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('discovered-devices-changed', deviceManager.getDiscoveredDevices());
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('discovered-devices-changed', deviceManager.getDiscoveredDevices());
         }
 
-        if (pairingManager.isPaired(deviceInfo.id) && !activeDeviceConnections.has(deviceInfo.id)) {
-            connectToDevice(deviceInfo, mainWindow);
+        // Only auto-connect to devices that are ALREADY paired
+        if (deviceInfo && deviceInfo.id && pairingManager.isPaired(deviceInfo.id) === true && !activeDeviceConnections.has(deviceInfo.id)) {
+            console.log(`[Bridge] Connecting to paired device ${deviceInfo.name}...`);
+            connectToDevice(deviceInfo, currentMainWindow);
+        }
+    });
+
+
+    // Handle incoming TLS connections initiated from phone
+    deviceManager.on('incomingConnection', ({ tlsSocket, identityPacket }) => {
+        const deviceId = identityPacket?.body?.deviceId;
+        const deviceName = identityPacket?.body?.deviceName || 'Phone';
+        console.log(`[Bridge] Incoming TLS Connection accepted from ${tlsSocket.remoteAddress} (${deviceName})`);
+
+        if (!deviceId) {
+            tlsSocket.destroy();
+            return;
+        }
+
+        let tempDev = activeDeviceConnections.get(deviceId);
+
+        if (tempDev) {
+            // KDE Connect: the phone re-establishes its link every time it receives a
+            // UDP broadcast (LanLinkProvider.udpPacketReceived -> addOrUpdateLink ->
+            // link.reset). Reuse the existing Device instead of discarding plugin state.
+            console.log(`[Bridge] Reusing connection for ${deviceName} (${deviceId})`);
+            const oldSocket = tempDev.socket;
+            tempDev.socket = null;
+            tempDev.connected = false;
+            tempDev.buffer = '';
+            if (oldSocket) {
+                oldSocket.removeAllListeners('data');
+                oldSocket.removeAllListeners('close');
+                oldSocket.removeAllListeners('error');
+                oldSocket.destroy();
+            }
+            tempDev.info.ip = tlsSocket.remoteAddress;
+            tempDev.info.name = deviceName;
+        } else {
+            tempDev = new Device({
+                id: deviceId,
+                ip: tlsSocket.remoteAddress,
+                port: identityPacket?.body?.tcpPort || 1716,
+                name: deviceName,
+                type: identityPacket?.body?.deviceType || 'phone',
+                protocolVersion: identityPacket?.body?.protocolVersion || 7,
+                incomingCapabilities: identityPacket?.body?.incomingCapabilities || [],
+                outgoingCapabilities: identityPacket?.body?.outgoingCapabilities || []
+            }, cryptoHelper);
+
+            tempDev.on('packet', (packet) => {
+                if (packet.type === 'kdeconnect.identity') {
+                    tempDev.info.id = packet.body.deviceId;
+                    tempDev.info.name = packet.body.deviceName || 'Android Device';
+                    console.log(`[Bridge] Authenticated connection from ${tempDev.info.name} (${tempDev.info.id})`);
+                } else {
+                    packetRouter.routePacket(tempDev, packet);
+                }
+            });
+
+            activeDeviceConnections.set(deviceId, tempDev);
+        }
+
+        tempDev.socket = tlsSocket;
+        tempDev.connected = true;
+
+        tlsSocket.setEncoding('utf8');
+        tlsSocket.on('data', (data) => tempDev.handleRawData(data));
+        tlsSocket.on('close', () => tempDev.handleDisconnect('Socket closed'));
+        tlsSocket.on('error', (err) => tempDev.handleDisconnect(err.message));
+
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('device-status-changed', {
+                name: tempDev.info.name,
+                connected: true
+            });
+        }
+    });
+
+    // Pairing Manager Events
+    pairingManager.on('pairingRequested', (data) => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('pairing-requested', data);
         }
     });
 
     // Forward Plugin Events to React Renderer
     pluginEvents.on('notificationReceived', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('notification-received', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('notification-received', data);
     });
 
     pluginEvents.on('batteryStateChanged', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('device-status-changed', { battery: data.charge, isCharging: data.isCharging });
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('device-status-changed', { battery: data.charge, isCharging: data.isCharging });
     });
 
     pluginEvents.on('connectivityStateChanged', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('device-status-changed', { signal: data.signalStrength });
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('device-status-changed', { signal: data.signalStrength });
     });
 
     pluginEvents.on('clipboardReceived', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('clipboard-received', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('clipboard-received', data);
     });
 
     pluginEvents.on('mediaStateChanged', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('media-state-changed', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('media-state-changed', data);
     });
 
     pluginEvents.on('incomingCall', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('incoming-call', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('incoming-call', data);
     });
 
     pluginEvents.on('smsThreadsUpdated', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('sms-threads-updated', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('sms-threads-updated', data);
     });
 
     pluginEvents.on('contactsUpdated', (data) => {
-        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('contacts-updated', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('contacts-updated', data);
     });
 
-    // Phase 5 IPC Handlers
+    // HFP Bluetooth Events
+    hfpProtocol.on('incomingCallRinging', () => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('incoming-call', { status: 'RINGING' });
+        }
+    });
+
+    hfpProtocol.on('callAnswered', () => {
+        audioBridge.startAudioRouting();
+    });
+
+    hfpProtocol.on('callEnded', () => {
+        audioBridge.stopAudioRouting();
+    });
+
+    // IPC Handlers for Call Audio Actions
+    ipcMain.on('answer-call-audio', () => {
+        hfpProtocol.answerCall();
+        audioBridge.startAudioRouting();
+    });
+
+    ipcMain.on('hangup-call-audio', () => {
+        hfpProtocol.hangupCall();
+        audioBridge.stopAudioRouting();
+    });
+
+    ipcMain.on('toggle-mute-audio', (event, { muted }) => {
+        audioBridge.setMicrophoneMuted(muted);
+        hfpProtocol.setMicrophoneVolume(muted ? 0 : 12);
+    });
+
+    ipcMain.on('transfer-call-audio', (event, { target }) => {
+        if (target === 'PHONE_EARPIECE') {
+            audioBridge.transferCallAudioToPhone();
+        } else {
+            audioBridge.transferCallAudioToPc();
+        }
+    });
+
+    ipcMain.on('dial-number', (event, { number }) => {
+        console.log(`[Bridge] Dialing via Bluetooth HFP: ${number}`);
+        hfpProtocol.dialNumber(number);
+        audioBridge.startAudioRouting();
+    });
+
+    // Storage & Files Handlers
     ipcMain.handle('fetch-files', async (event, { path }) => {
         try {
             return await sftpPlugin.listDirectory(path || '/sdcard');
         } catch (e) {
-            console.warn('[Bridge] fetch-files error:', e.message);
             return [];
         }
     });
@@ -142,7 +289,6 @@ function initKDEConnectBridge(mainWindow) {
         const activeDev = getFirstActiveDevice();
         if (activeDev) {
             const desktopPath = require('path').join(require('os').homedir(), 'Desktop', name);
-            console.log(`[Bridge] Downloading ${remotePath} to ${desktopPath}...`);
             await sftpPlugin.downloadFile(remotePath, desktopPath);
         }
     });
@@ -151,19 +297,30 @@ function initKDEConnectBridge(mainWindow) {
         const activeDev = getFirstActiveDevice();
         if (activeDev) {
             const fileName = require('path').basename(localPath);
-            const remotePath = `${remoteDirectory}/${fileName}`;
-            console.log(`[Bridge] Uploading ${localPath} to ${remotePath}...`);
-            await sftpPlugin.uploadFile(localPath, remotePath);
+            await sftpPlugin.uploadFile(localPath, `${remoteDirectory}/${fileName}`);
         }
     });
 
     ipcMain.on('delete-file', async (event, { remotePath, isDir }) => {
         const activeDev = getFirstActiveDevice();
+        if (activeDev) await sftpPlugin.deleteItem(remotePath, isDir);
+    });
+
+    ipcMain.on('scan-photos', async () => {
+        const activeDev = getFirstActiveDevice();
         if (activeDev) {
-            await sftpPlugin.deleteItem(remotePath, isDir);
+            try {
+                const dcimFiles = await sftpPlugin.listDirectory('/sdcard/DCIM/Camera');
+                if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+                    currentMainWindow.webContents.send('photos-updated', dcimFiles);
+                }
+            } catch (e) {
+                console.warn('[Bridge] scan-photos failed:', e.message);
+            }
         }
     });
 
+    // Messaging & Contacts Handlers
     ipcMain.on('send-sms', (event, { phoneNumber, messageText }) => {
         const activeDev = getFirstActiveDevice();
         if (activeDev) smsPlugin.sendSms(activeDev, phoneNumber, messageText);
@@ -177,10 +334,6 @@ function initKDEConnectBridge(mainWindow) {
     ipcMain.on('share-url', (event, { url }) => {
         const activeDev = getFirstActiveDevice();
         if (activeDev) sharePlugin.shareUrlToPhone(activeDev, url);
-    });
-
-    ipcMain.on('dial-number', (event, { number }) => {
-        console.log(`[Bridge] Dialing number: ${number}`);
     });
 
     ipcMain.on('send-reply', (event, { requestReplyId, text }) => {
@@ -211,20 +364,54 @@ function initKDEConnectBridge(mainWindow) {
         if (activeDev) findMyPhonePlugin.ringPhone(activeDev);
     });
 
-    ipcMain.handle('get-discovered-devices', () => deviceManager.getDiscoveredDevices());
+    ipcMain.handle('get-discovered-devices', () => {
+        if (deviceManager) {
+            deviceManager.sendIdentityBroadcast();
+            return deviceManager.getDiscoveredDevices();
+        }
+        return [];
+    });
 
     ipcMain.handle('pair-device', (event, deviceId) => {
         const devInfo = deviceManager.discoveredDevices.get(deviceId);
         if (!devInfo) return { success: false, message: 'Device not found' };
 
         let devConn = activeDeviceConnections.get(deviceId);
-        if (!devConn) devConn = connectToDevice(devInfo, mainWindow);
+        if (!devConn) {
+            devConn = connectToDevice(devInfo, currentMainWindow);
+        }
 
-        pairingManager.requestPair(devConn);
+        if (devConn.connected) {
+            pairingManager.requestPair(devConn);
+        } else {
+            devConn.once('connected', () => {
+                pairingManager.requestPair(devConn);
+            });
+        }
         return { success: true };
     });
 
-    return { cryptoHelper, deviceManager, packetRouter, pairingManager };
+
+    ipcMain.handle('accept-pair', (event, deviceId) => {
+        const devConn = activeDeviceConnections.get(deviceId);
+        if (devConn) {
+            pairingManager.acceptPair(devConn);
+            return { success: true };
+        }
+        return { success: false, message: 'Device connection not active' };
+    });
+
+    ipcMain.handle('unpair-device', (event, deviceId) => {
+        pairingManager.unpair(deviceId);
+        const devConn = activeDeviceConnections.get(deviceId);
+        if (devConn) {
+            pairingManager.rejectPair(devConn);
+            devConn.disconnect();
+        }
+        return { success: true };
+    });
+
+    return { cryptoHelper, deviceManager, packetRouter, pairingManager, btManager, hfpProtocol, audioBridge };
 }
 
 function getFirstActiveDevice() {
@@ -233,12 +420,18 @@ function getFirstActiveDevice() {
 }
 
 function connectToDevice(deviceInfo, mainWindow) {
+    if (activeDeviceConnections.has(deviceInfo.id)) {
+        return activeDeviceConnections.get(deviceInfo.id);
+    }
+
     const deviceConnection = new Device(deviceInfo, cryptoHelper);
+    activeDeviceConnections.set(deviceInfo.id, deviceConnection);
 
     deviceConnection.on('connected', (info) => {
         activeDeviceConnections.set(info.id, deviceConnection);
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('device-status-changed', {
+        const win = currentMainWindow || mainWindow;
+        if (win && !win.isDestroyed()) {
+            win.webContents.send('device-status-changed', {
                 name: info.name,
                 connected: true,
                 battery: batteryPlugin ? batteryPlugin.batteryState.charge : 85,
@@ -248,7 +441,9 @@ function connectToDevice(deviceInfo, mainWindow) {
             });
         }
 
-        // Request initial data sync
+        // Connect Bluetooth HFP channel alongside KDE Connect TCP link
+        btManager.connectHfp(info.ip);
+
         notificationPlugin.requestAllNotifications(deviceConnection);
         batteryPlugin.requestBatteryStatus(deviceConnection);
         connectivityPlugin.requestReport(deviceConnection);
@@ -263,8 +458,10 @@ function connectToDevice(deviceInfo, mainWindow) {
 
     deviceConnection.on('disconnected', ({ info }) => {
         activeDeviceConnections.delete(info.id);
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('device-status-changed', { name: info.name, connected: false });
+        btManager.disconnectHfp();
+        const win = currentMainWindow || mainWindow;
+        if (win && !win.isDestroyed()) {
+            win.webContents.send('device-status-changed', { name: info.name, connected: false });
         }
     });
 
@@ -272,4 +469,4 @@ function connectToDevice(deviceInfo, mainWindow) {
     return deviceConnection;
 }
 
-module.exports = { initKDEConnectBridge };
+module.exports = { initKDEConnectBridge, setMainWindow };
