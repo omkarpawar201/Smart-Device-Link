@@ -272,6 +272,7 @@ class CryptoHelper {
                     'kdeconnect.sftp',
                     'kdeconnect.share.request',
                     'kdeconnect.mpris',
+                    'kdeconnect.mpris.request',
                     'kdeconnect.ping',
                     'kdeconnect.connectivity_report',
                     'kdeconnect.findmyphone'
@@ -288,6 +289,7 @@ class CryptoHelper {
                     'kdeconnect.clipboard',
                     'kdeconnect.share.request',
                     'kdeconnect.mpris',
+                    'kdeconnect.mpris.request',
                     'kdeconnect.ping',
                     'kdeconnect.findmyphone.request'
                 ]

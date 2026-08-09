@@ -219,12 +219,25 @@ class SftpPlugin extends BasePlugin {
         }));
     }
 
-    async uploadFile(localFilePath, remoteFilePath) {
+    async uploadFile(localFilePath, remoteFilePath, onProgress) {
         return this.withSession(this.currentDevice, (sftp) => new Promise((resolve, reject) => {
-            sftp.fastPut(localFilePath, remoteFilePath, (err) => {
-                if (err) return reject(err);
-                resolve(remoteFilePath);
+            const total = fs.statSync(localFilePath).size || 0;
+            let transferred = 0;
+
+            const readStream = fs.createReadStream(localFilePath);
+            const writeStream = sftp.createWriteStream(remoteFilePath);
+
+            writeStream.on('close', () => resolve(remoteFilePath));
+            writeStream.on('error', (err) => reject(err));
+            readStream.on('error', (err) => reject(err));
+            readStream.on('data', (chunk) => {
+                transferred += chunk.length;
+                if (onProgress && total > 0) {
+                    onProgress(Math.min(1, transferred / total));
+                }
             });
+
+            readStream.pipe(writeStream);
         }));
     }
 

@@ -69,6 +69,28 @@ class ClipboardPlugin extends BasePlugin {
     getHistory() {
         return this.history;
     }
+
+    clearHistory() {
+        this.history = [];
+    }
+
+    removeFromHistory(id) {
+        this.history = this.history.filter((h) => h.id !== id);
+    }
+
+    addSentFromPc(content, source) {
+        if (!content) return null;
+        this.lastContent = content;
+        const item = {
+            id: `pc_${Date.now()}`,
+            content,
+            source: source || 'PC',
+            time: Date.now()
+        };
+        this.history.unshift(item);
+        if (this.history.length > 20) this.history.pop();
+        return item;
+    }
 }
 
 module.exports = ClipboardPlugin;

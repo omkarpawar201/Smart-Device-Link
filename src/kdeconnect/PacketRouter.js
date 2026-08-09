@@ -31,19 +31,19 @@ class PacketRouter extends EventEmitter {
         });
     }
 
-    routePacket(device, packet) {
+    routePacket(device, packet, payload) {
         if (!packet || !packet.type) return;
 
         // Emit event for core system listeners
-        this.emit(`packet:${packet.type}`, { device, packet });
-        this.emit('packet', { device, packet });
+        this.emit(`packet:${packet.type}`, { device, packet, payload });
+        this.emit('packet', { device, packet, payload });
 
         // Route to registered plugins
         const handlers = this.plugins.get(packet.type);
         if (handlers && handlers.length > 0) {
             handlers.forEach((plugin) => {
                 try {
-                    plugin.handlePacket(device, packet);
+                    plugin.handlePacket(device, packet, payload);
                 } catch (err) {
                     console.error(`[PacketRouter Error in ${plugin.name}]:`, err.message);
                 }

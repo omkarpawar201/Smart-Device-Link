@@ -28,6 +28,7 @@ export default function Files({ device }) {
     const dragCounter = useRef(0);
     const [isUploading, setIsUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(0);
+    const [uploads, setUploads] = useState([]);
 
     const [files, setFiles] = useState([]);
     const [isLoading, setIsLoading] = useState(false);
@@ -87,10 +88,6 @@ export default function Files({ device }) {
     const currentRoot = storageRoots.find(
         (r) => currentPath === r.path || currentPath.startsWith(r.path + '/')
     ) || null;
-
-    const handleRootChange = (rootPath) => {
-        loadDirectory(rootPath);
-    };
 
     const handleNavigate = (newPath) => {
         loadDirectory(newPath);
@@ -160,6 +157,33 @@ export default function Files({ device }) {
         }
     };
 
+    useEffect(() => {
+        if (!window.api || !window.api.onUploadProgress) return;
+        return window.api.onUploadProgress(({ name, progress, done, failed }) => {
+            setUploads((prev) => {
+                if (!prev.length) return prev;
+                return prev.map((u) =>
+                    u.name === name ? { ...u, transferred: u.size * progress, done: !!done, failed: !!failed } : u
+                );
+            });
+        });
+    }, []);
+
+    useEffect(() => {
+        if (!uploads.length) return;
+        const totalBytes = uploads.reduce((s, u) => s + u.size, 0);
+        const transferredBytes = uploads.reduce((s, u) => s + u.transferred, 0);
+        setUploadProgress(totalBytes > 0 ? Math.floor((transferredBytes / totalBytes) * 100) : 0);
+        if (uploads.every((u) => u.done)) {
+            const timer = setTimeout(() => {
+                setIsUploading(false);
+                setUploads([]);
+                setUploadProgress(0);
+            }, 800);
+            return () => clearTimeout(timer);
+        }
+    }, [uploads]);
+
     const handleDrop = (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -169,10 +193,17 @@ export default function Files({ device }) {
         const droppedFiles = Array.from(e.dataTransfer.files);
         if (droppedFiles.length === 0) return;
 
+        const batch = droppedFiles.map((file) => ({
+            name: file.name,
+            size: file.size || 0,
+            transferred: 0,
+            done: false
+        }));
+        setUploads(batch);
         setIsUploading(true);
         setUploadProgress(0);
 
-        droppedFiles.forEach((file, index) => {
+        droppedFiles.forEach((file) => {
             const localPath = window.api && window.api.getPathForFile ? window.api.getPathForFile(file) : file.path || '';
 
             const newFileObj = {
@@ -190,14 +221,7 @@ export default function Files({ device }) {
                     remoteDirectory: currentPath
                 });
             }
-
-            setUploadProgress(Math.floor(((index + 1) / droppedFiles.length) * 100));
         });
-
-        setTimeout(() => {
-            setIsUploading(false);
-            setUploadProgress(0);
-        }, 1500);
     };
 
     const formatSize = (bytes) => {
@@ -219,6 +243,11 @@ export default function Files({ device }) {
     };
 
     const pathParts = currentPath.split('/').filter(Boolean);
+    const rootParts = (currentRoot?.path || '').split('/').filter(Boolean);
+    const crumbParts =
+        rootParts.length && (currentPath === currentRoot.path || currentPath.startsWith(currentRoot.path + '/'))
+            ? pathParts.slice(rootParts.length)
+            : pathParts;
     const filteredFiles = files.filter((f) => f.name.toLowerCase().includes(searchQuery.toLowerCase()));
 
     return (
@@ -298,6 +327,37 @@ export default function Files({ device }) {
                                 }}
                             />
                         </div>
+                        {uploads.map((u) => {
+                            const pct = u.size > 0 ? Math.floor((u.transferred / u.size) * 100) : u.done ? 100 : 0;
+                            return (
+                                <div key={u.name} style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '8px' }}>
+                                    <span style={{ fontSize: '12px', color: u.failed ? 'var(--accent-rose)' : 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '220px' }}>
+                                        {u.name}
+                                    </span>
+                                    <div
+                                        style={{
+                                            flex: 1,
+                                            height: '3px',
+                                            background: 'rgba(255, 255, 255, 0.1)',
+                                            borderRadius: '999px',
+                                            overflow: 'hidden'
+                                        }}
+                                    >
+                                        <div
+                                            style={{
+                                                width: `${pct}%`,
+                                                height: '100%',
+                                                background: u.failed ? 'var(--accent-rose)' : u.done ? 'var(--accent-green, #34d399)' : 'var(--accent-cyan)',
+                                                transition: 'width 0.2s ease'
+                                            }}
+                                        />
+                                    </div>
+                                    <span style={{ fontSize: '11px', color: 'var(--text-muted)', width: '40px', textAlign: 'right' }}>
+                                        {u.failed ? 'Failed' : u.done ? 'Done' : `${pct}%`}
+                                    </span>
+                                </div>
+                            );
+                        })}
                     </div>
                 </div>
             )}
@@ -393,21 +453,6 @@ export default function Files({ device }) {
             >
                 {/* Breadcrumbs */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 500 }}>
-                    {storageRoots.length > 0 && (
-                        <select
-                            className="input-glass"
-                            value={currentRoot ? currentRoot.path : storageRoots[0].path}
-                            onChange={(e) => handleRootChange(e.target.value)}
-                            title="Select storage"
-                            style={{ fontSize: '12px', padding: '6px 8px', cursor: 'pointer', color: 'var(--text-primary)' }}
-                        >
-                            {storageRoots.map((r) => (
-                                <option key={r.id} value={r.path}>
-                                    {r.name}
-                                </option>
-                            ))}
-                        </select>
-                    )}
                     <button
                         className="btn-secondary"
                         onClick={handleGoUp}
@@ -428,8 +473,8 @@ export default function Files({ device }) {
                     <span onClick={() => handleNavigate(currentRoot ? currentRoot.path : '/sdcard')} style={{ cursor: 'pointer', color: 'var(--accent-cyan)' }}>
                         {currentRoot ? currentRoot.name : 'Internal Storage'}
                     </span>
-                    {pathParts.map((part, index) => {
-                        const subPath = '/' + pathParts.slice(0, index + 1).join('/');
+                    {crumbParts.map((part, index) => {
+                        const subPath = '/' + pathParts.slice(0, rootParts.length + index + 1).join('/');
                         return (
                             <React.Fragment key={subPath}>
                                 <ChevronRight size={14} color="var(--text-muted)" />
@@ -437,8 +482,8 @@ export default function Files({ device }) {
                                     onClick={() => handleNavigate(subPath)}
                                     style={{
                                         cursor: 'pointer',
-                                        color: index === pathParts.length - 1 ? 'var(--text-primary)' : 'var(--text-secondary)',
-                                        fontWeight: index === pathParts.length - 1 ? 600 : 400
+                                        color: index === crumbParts.length - 1 ? 'var(--text-primary)' : 'var(--text-secondary)',
+                                        fontWeight: index === crumbParts.length - 1 ? 600 : 400
                                     }}
                                 >
                                     {part}

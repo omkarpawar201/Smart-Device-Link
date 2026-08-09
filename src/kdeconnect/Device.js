@@ -13,7 +13,8 @@ class Device extends EventEmitter {
         this.socket = null;
         this.connected = false;
         this.isPaired = false;
-        this.buffer = '';
+        this.buffer = Buffer.alloc(0);
+        this._pendingPayload = null;
         this.lastPacketAt = 0;
         this.heartbeatInterval = null;
     }
@@ -136,25 +137,113 @@ class Device extends EventEmitter {
 
     handleRawData(data) {
         this.lastPacketAt = Date.now();
-        this.buffer += data;
+        this.buffer = Buffer.concat([this.buffer, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
 
-        // KDE Connect protocol uses newline-delimited JSON packets
-        let newlineIndex = this.buffer.indexOf('\n');
+        // If a packet declared a payload earlier but not all bytes had arrived yet,
+        // finish consuming them before parsing any new JSON lines.
+        if (this._pendingPayload) {
+            if (this.buffer.length < this._pendingPayload.remaining) return;
+            const pendingPayload = Buffer.from(this.buffer.subarray(0, this._pendingPayload.remaining));
+            this.buffer = this.buffer.subarray(this._pendingPayload.remaining);
+            this.emit('packet', this._pendingPayload.packet, pendingPayload);
+            this._pendingPayload = null;
+        }
+
+        // KDE Connect protocol uses newline-delimited JSON packets, optionally followed
+        // by a binary payload (e.g. album art) of `payloadSize` bytes.
+        let newlineIndex = this.buffer.indexOf(0x0a);
         while (newlineIndex !== -1) {
-            const jsonLine = this.buffer.substring(0, newlineIndex).trim();
-            this.buffer = this.buffer.substring(newlineIndex + 1);
+            const jsonLine = this.buffer.subarray(0, newlineIndex).toString('utf8').trim();
+            this.buffer = this.buffer.subarray(newlineIndex + 1);
 
             if (jsonLine.length > 0) {
                 try {
                     const packet = JSON.parse(jsonLine);
-                    this.emit('packet', packet);
+                    const payloadSize = packet.payloadSize;
+                    const transferPort = packet.payloadTransferInfo && packet.payloadTransferInfo.port;
+                    if (payloadSize > 0 && transferPort) {
+                        // KDE Connect transfers payloads over a SEPARATE TCP connection
+                        // (mirroring the main link's TLS): the sender advertises a port in
+                        // payloadTransferInfo and waits for us to connect to it. Do NOT wait
+                        // for the bytes on the main socket or every later packet would stall.
+                        this.receivePayloadOverSocket(packet, payloadSize, transferPort);
+                    } else if (payloadSize > 0) {
+                        // Legacy/fallback: payload bytes arrive immediately after the JSON
+                        // line on the same socket.
+                        if (this.buffer.length < payloadSize) {
+                            this._pendingPayload = { packet, remaining: payloadSize };
+                            return; // wait for the rest of the payload to arrive
+                        }
+                        const payload = Buffer.from(this.buffer.subarray(0, payloadSize));
+                        this.buffer = this.buffer.subarray(payloadSize);
+                        this.emit('packet', packet, payload);
+                    } else {
+                        this.emit('packet', packet);
+                    }
                 } catch (err) {
                     console.warn('[Device] Failed to parse JSON packet:', err.message);
                 }
             }
 
-            newlineIndex = this.buffer.indexOf('\n');
+            newlineIndex = this.buffer.indexOf(0x0a);
         }
+    }
+
+    // The sender (phone) is listening on payloadTransferInfo.port and hands that socket
+    // over to TLS (server role). We connect to it as the TLS client and read `size` raw
+    // bytes, then emit the packet with the payload attached.
+    receivePayloadOverSocket(packet, size, port) {
+        let downloaded = 0;
+        const chunks = [];
+        let finished = false;
+
+        const finish = (payload) => {
+            if (finished) return;
+            finished = true;
+            try { sock.destroy(); } catch (e) { /* already closed */ }
+            this.emit('packet', packet, payload);
+        };
+
+        const partial = () => (downloaded > 0 ? Buffer.concat(chunks).subarray(0, Math.min(downloaded, size)) : undefined);
+
+        const sock = tls.connect({
+            host: this.info.ip,
+            port,
+            rejectUnauthorized: false,
+            requestCert: false,
+            key: this.crypto.privateKey,
+            cert: this.crypto.certificate,
+            minVersion: 'TLSv1.2',
+            maxVersion: 'TLSv1.2'
+        });
+
+        sock.on('secureConnect', () => {
+            sock.setTimeout(10000);
+        });
+
+        sock.on('data', (chunk) => {
+            chunks.push(chunk);
+            downloaded += chunk.length;
+            if (downloaded >= size) {
+                finish(Buffer.concat(chunks).subarray(0, size));
+            }
+        });
+
+        sock.on('error', (err) => {
+            console.warn(`[Device] Payload transfer from ${this.info.name} (${this.info.ip}:${port}) failed: ${err.message}`);
+            finish(partial());
+        });
+
+        sock.on('timeout', () => {
+            console.warn(`[Device] Payload transfer from ${this.info.name} timed out.`);
+            finish(partial());
+        });
+
+        sock.on('end', () => {
+            finish(partial());
+        });
+
+        sock.setTimeout(10000);
     }
 
     sendPacket(packet) {

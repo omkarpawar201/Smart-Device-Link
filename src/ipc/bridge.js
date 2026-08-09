@@ -1,4 +1,4 @@
-const { ipcMain, app } = require('electron');
+const { ipcMain, app, protocol, clipboard: electronClipboard } = require('electron');
 const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
@@ -25,6 +25,9 @@ const SharePlugin = require('../kdeconnect/plugins/SharePlugin');
 
 // Phase 5 Plugins
 const SftpPlugin = require('../kdeconnect/plugins/SftpPlugin');
+
+// Real PC media session control (system media keys + master volume)
+const PcMediaController = require('../system/PcMediaController');
 
 // Phase 6 Bluetooth HFP Engine & Audio Bridge
 const BluetoothManager = require('../bluetooth/BluetoothManager');
@@ -57,6 +60,10 @@ let contactsPlugin = null;
 let sharePlugin = null;
 let sftpPlugin = null;
 
+// Real PC media session controller (win32 only)
+let pcMediaController = null;
+let lastPcVolume = null;
+
 function setMainWindow(win) {
     currentMainWindow = win;
 }
@@ -76,6 +83,9 @@ function initKDEConnectBridge(mainWindow) {
     btManager = new BluetoothManager();
     hfpProtocol = new HfpProtocol(btManager);
     audioBridge = new AudioBridge();
+
+    // Real PC media session control (Windows-only; falls back to optimistic state if unavailable)
+    if (process.platform === 'win32') pcMediaController = new PcMediaController();
 
     // Instantiate Plugins
     notificationPlugin = new NotificationPlugin(pluginEvents);
@@ -107,6 +117,14 @@ function initKDEConnectBridge(mainWindow) {
 
     // Start UDP discovery
     deviceManager.startDiscovery();
+
+    // Some phone players (e.g. Apple Music) don't push volume changes to KDE Connect,
+    // so poll the current player's now-playing + volume so the PC app's volume bar stays
+    // in sync even when the volume is changed on the phone itself.
+    setInterval(() => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && mprisPlugin) mprisPlugin.refreshCurrentPlayer(activeDev);
+    }, 4000);
 
     // Forward Discovered Devices to UI
     const outboundRetryWindow = new Map(); // deviceId -> last outbound attempt (ms)
@@ -174,7 +192,7 @@ function initKDEConnectBridge(mainWindow) {
             console.log(`[Bridge] Reusing connection for ${deviceName} (${deviceId})`);
             const oldSocket = tempDev.socket;
             tempDev.socket = null;
-            tempDev.buffer = '';
+            tempDev.buffer = Buffer.alloc(0);
 
             if (oldSocket) {
                 oldSocket.removeAllListeners();
@@ -201,13 +219,13 @@ function initKDEConnectBridge(mainWindow) {
                 outgoingCapabilities: identityPacket?.body?.outgoingCapabilities || []
             }, cryptoHelper);
 
-            tempDev.on('packet', (packet) => {
+            tempDev.on('packet', (packet, payload) => {
                 if (packet.type === 'kdeconnect.identity') {
                     tempDev.info.id = packet.body.deviceId;
                     tempDev.info.name = packet.body.deviceName || 'Android Device';
                     console.log(`[Bridge] Authenticated connection from ${tempDev.info.name} (${tempDev.info.id})`);
                 } else {
-                    packetRouter.routePacket(tempDev, packet);
+                    packetRouter.routePacket(tempDev, packet, payload);
                 }
             });
 
@@ -256,6 +274,8 @@ function initKDEConnectBridge(mainWindow) {
         // Request battery, connectivity, notifications, SMS threads, and contacts on initial connection
         if (batteryPlugin) batteryPlugin.requestBatteryStatus(tempDev);
         if (connectivityPlugin) connectivityPlugin.requestReport(tempDev);
+        if (mprisPlugin) mprisPlugin.requestMediaState(tempDev);
+        if (mprisPlugin) mprisPlugin.sendPcPlayerList(tempDev);
         if (!isReused) {
             if (notificationPlugin) notificationPlugin.requestAllNotifications(tempDev);
             if (smsPlugin) smsPlugin.requestAllThreads(tempDev);
@@ -364,6 +384,17 @@ function initKDEConnectBridge(mainWindow) {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('media-state-changed', data);
     });
 
+    pluginEvents.on('pcMediaRequest', (data) => {
+        // Route phone -> PC control to the real system media session (media keys / master volume).
+        const body = (data && data.body) || {};
+        console.log('[bridge] phone -> PC media request:', JSON.stringify(body));
+        handlePcMediaCommand(body);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('pc-media-request', data);
+        // Immediately re-read the real session so the phone sees the result of its control
+        // (play/pause/track/seek) without waiting for the 2s poller.
+        refreshPcMediaState();
+    });
+
     pluginEvents.on('incomingCall', (data) => {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('incoming-call', data);
     });
@@ -454,20 +485,12 @@ function initKDEConnectBridge(mainWindow) {
         }
     });
 
-    // Discovers the phone's available storage roots (internal storage and any SD cards)
-    // by probing Android mount points through SFTP.
+    // Resolves the phone's internal storage root through SFTP. SD card detection is
+    // unreliable across Android versions (SFTP is often chrooted to the configured root),
+    // so only internal storage is surfaced.
     ipcMain.handle('list-storage-roots', async () => {
         const activeDev = getFirstActiveDevice();
         if (!activeDev || !sftpPlugin) return [];
-
-        const roots = [];
-        const seen = new Set();
-
-        const tryAdd = (id, name, path) => {
-            if (!path || seen.has(path)) return;
-            seen.add(path);
-            roots.push({ id, name, path });
-        };
 
         const readable = async (p) => {
             try {
@@ -478,87 +501,49 @@ function initKDEConnectBridge(mainWindow) {
             }
         };
 
-        // Directories under /storage that are internal-storage mounts (NOT SD cards).
-        const INTERNAL_DIR = /^(emulated|self|primary|sdcard|sdcard0)$/i;
-
-        const isInternalPath = (p) => {
-            if (p === internalPath) return true;
-            return /^\/(sdcard|mnt\/sdcard|storage\/emulated\/0|storage\/self\/primary)$/.test(p);
-        };
-
-        // Resolve the internal storage root once, so only one "Internal Storage" entry is shown.
-        let internalPath = null;
+        // Resolve the internal storage root. The SFTP-configured root is guaranteed to
+        // be readable, so it is used as a fallback if the standard paths are unavailable.
+        let rootPath = null;
         for (const candidate of ['/sdcard', '/storage/emulated/0', '/storage/self/primary', '/mnt/sdcard']) {
             if (await readable(candidate)) {
-                internalPath = candidate;
+                rootPath = candidate;
                 break;
             }
         }
-        if (internalPath) tryAdd('internal', 'Internal Storage', internalPath);
-
-        const classifySD = async (p) => {
-            if (!p || seen.has(p) || isInternalPath(p)) return;
-            if (await readable(p)) {
-                tryAdd(`sd_${p.replace(/[^a-zA-Z0-9]+/g, '_')}`, 'SD Card', p);
-            }
-        };
-
-        // Scan /storage for removable SD cards (everything there that isn't internal storage).
-        try {
-            const entries = await sftpPlugin.listDirectory('/storage');
-            for (const entry of entries) {
-                if (!entry.isDir) continue;
-                if (INTERNAL_DIR.test(entry.name)) continue;
-                await classifySD(`/storage/${entry.name}`);
-            }
-        } catch (e) {
-            // SFTP root may be chrooted to a single folder, so /storage is not listable;
-            // fall through to the other mount locations below.
+        if (!rootPath && sftpPlugin.sftpConfig && sftpPlugin.sftpConfig.path) {
+            rootPath = sftpPlugin.sftpConfig.path;
         }
+        if (!rootPath) return [];
 
-        // Physical SD card mounts live under /mnt/media_rw (UUID-style dirs).
-        try {
-            const entries = await sftpPlugin.listDirectory('/mnt/media_rw');
-            for (const entry of entries) {
-                if (!entry.isDir) continue;
-                await classifySD(`/mnt/media_rw/${entry.name}`);
-            }
-        } catch (e) {
-            // not listable
-        }
-
-        // Common well-known removable storage paths.
-        for (const p of [
-            '/storage/sdcard1',
-            '/storage/extSdCard',
-            '/storage/external_sd',
-            '/storage/ext_sd',
-            '/mnt/sdcard1',
-            '/mnt/extSdCard',
-            '/mnt/external_sd',
-            '/mnt/ext_sd',
-            '/mnt/expand'
-        ]) {
-            await classifySD(p);
-        }
-
-        // The SFTP plugin's configured root always works, so surface it if it isn't internal.
-        if (sftpPlugin.sftpConfig && sftpPlugin.sftpConfig.path) {
-            const cfgPath = sftpPlugin.sftpConfig.path;
-            if (cfgPath && cfgPath !== internalPath && !isInternalPath(cfgPath)) {
-                await classifySD(cfgPath);
-            }
-        }
-
-        console.log(`[Bridge] Storage roots (internal=${internalPath || 'none'}):`, roots.map((r) => `${r.name}@${r.path}`).join(', ') || 'none');
-        return roots;
+        return [{ id: 'internal', name: 'Internal Storage', path: rootPath }];
     });
 
     ipcMain.on('upload-file', async (event, { localPath, remoteDirectory }) => {
         const activeDev = getFirstActiveDevice();
         if (activeDev) {
             const fileName = require('path').basename(localPath);
-            await sftpPlugin.uploadFile(localPath, `${remoteDirectory}/${fileName}`);
+            const total = fs.statSync(localPath).size || 0;
+            const remotePath = `${remoteDirectory}/${fileName}`;
+            try {
+                await sftpPlugin.uploadFile(localPath, remotePath, (progress) => {
+                    if (!event.sender.isDestroyed()) {
+                        event.sender.send('upload-progress', {
+                            name: fileName,
+                            path: remotePath,
+                            progress,
+                            total
+                        });
+                    }
+                });
+                if (!event.sender.isDestroyed()) {
+                    event.sender.send('upload-progress', { name: fileName, path: remotePath, progress: 1, total, done: true });
+                }
+            } catch (err) {
+                console.error('[Bridge] upload-file failed:', err?.message || err);
+                if (!event.sender.isDestroyed()) {
+                    event.sender.send('upload-progress', { name: fileName, path: remotePath, progress: 0, total, done: true, failed: true });
+                }
+            }
         }
     });
 
@@ -582,6 +567,75 @@ function initKDEConnectBridge(mainWindow) {
     const photoCacheDir = path.join(app.getPath('temp'), 'smart_device_link_photos');
     if (!fs.existsSync(photoCacheDir)) fs.mkdirSync(photoCacheDir, { recursive: true });
 
+    // Maps cached photo filename -> remote path, so images can be fetched lazily on demand.
+    const photoRemoteMap = new Map();
+
+    // Concurrency-limited download queue so photo thumbnails don't saturate the shared
+    // SFTP session (which the file manager uses too).
+    const MAX_CONCURRENT_PHOTO_DOWNLOADS = 3;
+    let activePhotoDownloads = 0;
+    const pendingPhotoDownloads = [];
+
+    const pumpPhotoDownloads = () => {
+        while (activePhotoDownloads < MAX_CONCURRENT_PHOTO_DOWNLOADS && pendingPhotoDownloads.length) {
+            const { task, resolve, reject } = pendingPhotoDownloads.shift();
+            activePhotoDownloads += 1;
+            Promise.resolve()
+                .then(task)
+                .then(resolve, reject)
+                .finally(() => {
+                    activePhotoDownloads -= 1;
+                    pumpPhotoDownloads();
+                });
+        }
+    };
+
+    const enqueuePhotoDownload = (task) => new Promise((resolve, reject) => {
+        pendingPhotoDownloads.push({ task, resolve, reject });
+        pumpPhotoDownloads();
+    });
+
+    const photoMimeFor = (name) => {
+        const ext = path.extname(name).toLowerCase();
+        if (ext === '.png') return 'image/png';
+        if (ext === '.webp') return 'image/webp';
+        if (ext === '.gif') return 'image/gif';
+        if (ext === '.heic') return 'image/heic';
+        return 'image/jpeg';
+    };
+
+    // Serve cached phone photos to the renderer. Downloads the file from the phone on
+    // first request (throttled), then serves the local cache.
+    protocol.handle('photo-cache', async (request) => {
+        try {
+            const url = new URL(request.url);
+            const fileName = decodeURIComponent(path.basename(url.pathname));
+            const localPath = path.join(photoCacheDir, fileName);
+            if (!localPath.startsWith(photoCacheDir + path.sep)) {
+                return new Response('Forbidden', { status: 403 });
+            }
+
+            if (!fs.existsSync(localPath)) {
+                const remotePath = photoRemoteMap.get(fileName);
+                if (!remotePath || !sftpPlugin) {
+                    return new Response('Not found', { status: 404 });
+                }
+                await enqueuePhotoDownload(() => sftpPlugin.downloadFile(remotePath, localPath));
+                if (!fs.existsSync(localPath)) {
+                    return new Response('Not found', { status: 404 });
+                }
+            }
+
+            const { Readable } = require('stream');
+            return new Response(Readable.toWeb(fs.createReadStream(localPath)), {
+                headers: { 'Content-Type': photoMimeFor(fileName) }
+            });
+        } catch (e) {
+            console.warn('[Bridge] photo-cache request failed:', e.message);
+            return new Response('Not found', { status: 404 });
+        }
+    });
+
     async function scanAndCachePhotos() {
         const activeDev = getFirstActiveDevice();
         if (!activeDev || !sftpPlugin) return [];
@@ -597,21 +651,15 @@ function initKDEConnectBridge(mainWindow) {
             const photoList = [];
             for (const file of imageFiles) {
                 const localPath = path.join(photoCacheDir, file.name);
-                if (!fs.existsSync(localPath)) {
-                    try {
-                        await sftpPlugin.downloadFile(file.path, localPath);
-                    } catch (e) {
-                        console.warn(`[Bridge] Failed to download thumbnail for ${file.name}:`, e.message);
-                    }
-                }
-
+                photoRemoteMap.set(file.name, file.path);
                 photoList.push({
                     id: file.name,
                     name: file.name,
                     path: file.path,
-                    url: `file:///${localPath.replace(/\\/g, '/')}`,
+                    url: `photo-cache://local/${encodeURIComponent(file.name)}`,
                     date: file.modifyTime || Date.now(),
-                    size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`
+                    size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+                    cached: fs.existsSync(localPath)
                 });
             }
             return photoList;
@@ -684,18 +732,152 @@ function initKDEConnectBridge(mainWindow) {
         if (activeDev) notificationPlugin.dismissNotification(activeDev, id);
     });
 
-    ipcMain.on('send-clipboard', (event, { content }) => {
-        const activeDev = getFirstActiveDevice();
-        if (activeDev) clipboardPlugin.sendClipboard(activeDev, content);
+    // ===== Shared Clipboard =====
+
+    // PC -> phone clipboard auto-sync. Polls the OS clipboard; when the text changes
+    // (and it isn't content we just received from the phone) it forwards it to the
+    // device, mirroring KDE Connect's shared clipboard behaviour.
+    let clipboardWatchTimer = null;
+    let lastPcClipboard = '';
+    let clipboardAutoSync = true;
+
+    const pushClipboardItem = (item) => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('clipboard-received', item);
+        }
+    };
+
+    const startClipboardWatch = () => {
+        if (clipboardWatchTimer) return;
+        try {
+            lastPcClipboard = electronClipboard.readText() || '';
+        } catch (e) {
+            lastPcClipboard = '';
+        }
+        clipboardWatchTimer = setInterval(() => {
+            if (!clipboardAutoSync) return;
+            let text = '';
+            try {
+                text = electronClipboard.readText() || '';
+            } catch (e) {
+                return;
+            }
+            if (!text || text === lastPcClipboard) return;
+            if (clipboardPlugin && text === clipboardPlugin.lastContent) return; // echo of phone->pc
+            lastPcClipboard = text;
+
+            const activeDev = getFirstActiveDevice();
+            if (!activeDev || !clipboardPlugin) return;
+            clipboardPlugin.sendClipboard(activeDev, text);
+            const item = clipboardPlugin.addSentFromPc(text, 'PC');
+            if (item) pushClipboardItem(item);
+        }, 1500);
+    };
+
+    const stopClipboardWatch = () => {
+        if (clipboardWatchTimer) {
+            clearInterval(clipboardWatchTimer);
+            clipboardWatchTimer = null;
+        }
+    };
+
+    startClipboardWatch();
+
+    ipcMain.handle('get-clipboard-history', () => {
+        return clipboardPlugin ? clipboardPlugin.getHistory() : [];
     });
 
-    ipcMain.on('media-control', (event, { action, volume }) => {
-        const activeDev = getFirstActiveDevice();
-        if (activeDev) {
-            if (action === 'setVolume') mprisPlugin.setVolume(activeDev, volume);
-            else mprisPlugin.sendAction(activeDev, action);
+    ipcMain.handle('get-clipboard-auto-sync', () => clipboardAutoSync);
+
+    ipcMain.on('set-clipboard-auto-sync', (event, { enabled }) => {
+        clipboardAutoSync = !!enabled;
+        if (clipboardAutoSync) startClipboardWatch();
+        else stopClipboardWatch();
+    });
+
+    ipcMain.on('clear-clipboard-history', () => {
+        if (clipboardPlugin) clipboardPlugin.clearHistory();
+    });
+
+    ipcMain.on('remove-clipboard-item', (event, { id }) => {
+        if (clipboardPlugin) clipboardPlugin.removeFromHistory(id);
+    });
+
+    ipcMain.on('set-pc-clipboard', (event, { content }) => {
+        try {
+            electronClipboard.writeText(content || '');
+        } catch (e) {
+            console.warn('[Bridge] set-pc-clipboard failed:', e.message);
         }
     });
+
+    ipcMain.on('send-clipboard', (event, { content }) => {
+        if (!content) return;
+        const activeDev = getFirstActiveDevice();
+        if (!activeDev || !clipboardPlugin) return;
+        clipboardPlugin.sendClipboard(activeDev, content);
+        const item = clipboardPlugin.addSentFromPc(content, 'PC');
+        if (item) pushClipboardItem(item);
+    });
+
+    ipcMain.on('media-control', (event, { action, volume, setPos, seek }) => {
+        const activeDev = getFirstActiveDevice();
+        if (!activeDev || !mprisPlugin) return;
+        if (action === 'setVolume') mprisPlugin.setVolume(activeDev, volume);
+        else if (action === 'GetState') mprisPlugin.requestMediaState(activeDev);
+        else if (action === 'SetPos' || action === 'Seek') mprisPlugin.sendSeek(activeDev, action === 'SetPos' ? { setPos } : { seek });
+        else mprisPlugin.sendAction(activeDev, action);
+    });
+
+    ipcMain.on('pc-media-state-changed', (event, state) => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && mprisPlugin && state) mprisPlugin.broadcastPcState(activeDev, state);
+    });
+
+    // PC app's own controls (media panel buttons / volume slider) drive the real system session.
+    ipcMain.on('pc-media-command', (event, command) => {
+        handlePcMediaCommand(command || {});
+    });
+
+    // Poll the real system media session (master volume + now-playing via SMTC) so the phone's
+    // volume bar tracks physical volume keys / the actual media app, and the phone + app see the
+    // real title/artist/play-state/timeline of whatever is playing on the PC.
+    let lastPcNowPlayingSig = '';
+    setInterval(refreshPcMediaState, 2000);
+
+    // Read the real system session and push any changed fields to the phone + renderer.
+    function refreshPcMediaState() {
+        if (!pcMediaController) return;
+        pcMediaController.getNowPlaying().then((np) => {
+            return pcMediaController.getVolume().then((res) => {
+                const state = {};
+                if (typeof res.volume === 'number' && res.volume !== lastPcVolume) {
+                    lastPcVolume = res.volume;
+                    state.volume = res.volume;
+                }
+                // pos is floored coarsely only while paused (a paused track's position is
+                // static, so a coarse floor just suppresses needless rebroadcasts); while
+                // playing the true 1s position is sent so the app/phone get accurate progress.
+                const posKey = np.isPlaying ? Math.floor(np.pos || 0) : Math.floor((np.pos || 0) / 5);
+                const sig = `${np.title}|${np.artist}|${np.album}|${np.isPlaying}|${posKey}|${np.length}`;
+                if (sig !== lastPcNowPlayingSig) {
+                    lastPcNowPlayingSig = sig;
+                    state.title = np.title;
+                    state.artist = np.artist;
+                    state.album = np.album;
+                    state.isPlaying = np.isPlaying;
+                    state.pos = np.pos;
+                    state.length = np.length;
+                }
+                if (Object.keys(state).length === 0) return;
+                const activeDev = getFirstActiveDevice();
+                if (mprisPlugin && activeDev) mprisPlugin.broadcastPcState(activeDev, state);
+                if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+                    currentMainWindow.webContents.send('pc-media-state', state);
+                }
+            }).catch(() => { /* helper unavailable */ });
+        }).catch(() => { /* helper unavailable */ });
+    }
 
     ipcMain.on('ring-phone', () => {
         const activeDev = getFirstActiveDevice();
@@ -749,6 +931,49 @@ function getFirstActiveDevice() {
     return values.length > 0 ? values[0] : null;
 }
 
+// Translate a phone/app command into a real system media key press, master volume change,
+// or SMTC session seek.
+function handlePcMediaCommand(command) {
+    if (!pcMediaController) return;
+    const { action, setVolume, seek, setPos, SetPosition, Seek } = command || {};
+    if (typeof setVolume === 'number') {
+        console.log('[bridge] PC media command: setVolume', setVolume);
+        pcMediaController.setVolume(setVolume);
+    } else if (typeof SetPosition === 'number') {
+        console.log('[bridge] PC media command: SetPosition', SetPosition);
+        pcMediaController.setPos(SetPosition);
+    } else if (typeof Seek === 'number') {
+        console.log('[bridge] PC media command: Seek', Seek, '(us -> ms)');
+        pcMediaController.seek(Math.round(Seek / 1000));
+    } else if (typeof seek === 'number') {
+        console.log('[bridge] PC media command: seek', seek);
+        pcMediaController.seek(seek);
+    } else if (typeof setPos === 'number') {
+        console.log('[bridge] PC media command: setPos', setPos);
+        pcMediaController.setPos(setPos);
+    } else if (action === 'Play') {
+        console.log('[bridge] PC media command: Play');
+        pcMediaController.play();
+    } else if (action === 'Pause') {
+        console.log('[bridge] PC media command: Pause');
+        pcMediaController.pause();
+    } else if (action === 'PlayPause') {
+        console.log('[bridge] PC media command: PlayPause');
+        pcMediaController.playPause();
+    } else if (action === 'Next') {
+        console.log('[bridge] PC media command: Next');
+        pcMediaController.next();
+    } else if (action === 'Previous') {
+        console.log('[bridge] PC media command: Previous');
+        pcMediaController.previous();
+    } else if (action === 'Stop') {
+        console.log('[bridge] PC media command: Stop');
+        pcMediaController.stop();
+    } else {
+        console.log('[bridge] PC media command: UNHANDLED', JSON.stringify(command));
+    }
+}
+
 function connectToDevice(deviceInfo, mainWindow) {
     if (activeDeviceConnections.has(deviceInfo.id)) {
         return activeDeviceConnections.get(deviceInfo.id);
@@ -783,8 +1008,8 @@ function connectToDevice(deviceInfo, mainWindow) {
         sftpPlugin.requestSftpMount(deviceConnection);
     });
 
-    deviceConnection.on('packet', (packet) => {
-        packetRouter.routePacket(deviceConnection, packet);
+    deviceConnection.on('packet', (packet, payload) => {
+        packetRouter.routePacket(deviceConnection, packet, payload);
     });
 
     deviceConnection.on('connectfailed', () => {

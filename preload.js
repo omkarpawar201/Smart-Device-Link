@@ -30,6 +30,12 @@ contextBridge.exposeInMainWorld('api', {
     onMediaStateChanged: (callback) => {
         ipcRenderer.on('media-state-changed', (event, data) => callback(data));
     },
+    onPcMediaRequest: (callback) => {
+        ipcRenderer.on('pc-media-request', (event, data) => callback(data));
+    },
+    onPcMediaState: (callback) => {
+        ipcRenderer.on('pc-media-state', (event, data) => callback(data));
+    },
     onIncomingCall: (callback) => {
         ipcRenderer.on('incoming-call', (event, data) => callback(data));
     },
@@ -41,6 +47,9 @@ contextBridge.exposeInMainWorld('api', {
     },
     onPhotosUpdated: (callback) => {
         ipcRenderer.on('photos-updated', (event, data) => callback(data));
+    },
+    onUploadProgress: (callback) => {
+        ipcRenderer.on('upload-progress', (event, data) => callback(data));
     },
 
     // Resolve an absolute filesystem path for a File object from a drag/drop or file input
@@ -60,7 +69,13 @@ contextBridge.exposeInMainWorld('api', {
             'dismiss-notification',
             'clear-all-notifications',
             'send-clipboard',
+            'set-clipboard-auto-sync',
+            'clear-clipboard-history',
+            'remove-clipboard-item',
+            'set-pc-clipboard',
             'media-control',
+            'pc-media-state-changed',
+            'pc-media-command',
             'ring-phone',
             'send-sms',
             'fetch-sms-threads',
@@ -93,7 +108,9 @@ contextBridge.exposeInMainWorld('api', {
             'get-notifications',
             'get-sms-threads',
             'get-contacts',
-            'get-photos'
+            'get-photos',
+            'get-clipboard-history',
+            'get-clipboard-auto-sync'
         ];
         if (validChannels.includes(channel)) {
             return ipcRenderer.invoke(channel, data);

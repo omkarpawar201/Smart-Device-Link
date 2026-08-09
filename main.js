@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, protocol } = require('electron');
 const path = require('path');
 const { initKDEConnectBridge, setMainWindow } = require('./src/ipc/bridge');
 
@@ -7,6 +7,15 @@ let tray = null;
 let bridgeInitialized = false;
 
 const isDev = process.env.NODE_ENV !== 'production';
+
+// Privileged scheme for serving phone photo thumbnails/previews to the renderer.
+// Must be registered before the app is ready.
+protocol.registerSchemesAsPrivileged([
+    {
+        scheme: 'photo-cache',
+        privileges: { standard: true, secure: true, stream: true, bypassCSP: true }
+    }
+]);
 
 function createWindow() {
     mainWindow = new BrowserWindow({

@@ -1,6 +1,42 @@
 import React, { useState, useEffect } from 'react';
-import { Download, X } from 'lucide-react';
+import { Download, X, Loader, ImageOff } from 'lucide-react';
 import refreshIcon from './icons/refresh_icon.gif';
+
+function PhotoThumb({ src, name }) {
+    const [loaded, setLoaded] = useState(false);
+    const [failed, setFailed] = useState(false);
+
+    return (
+        <div style={{ position: 'relative', width: '100%', height: '200px', background: 'rgba(255, 255, 255, 0.04)' }}>
+            {!loaded && !failed && (
+                <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>
+                    <Loader size={22} className="spin" />
+                </div>
+            )}
+            {failed ? (
+                <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '6px', color: 'var(--text-muted)', fontSize: '11px' }}>
+                    <ImageOff size={20} />
+                    <span>Could not load</span>
+                </div>
+            ) : (
+                <img
+                    src={src}
+                    alt={name}
+                    onLoad={() => setLoaded(true)}
+                    onError={() => setFailed(true)}
+                    style={{
+                        width: '100%',
+                        height: '200px',
+                        objectFit: 'cover',
+                        display: 'block',
+                        opacity: loaded ? 1 : 0,
+                        transition: 'opacity 0.25s ease'
+                    }}
+                />
+            )}
+        </div>
+    );
+}
 
 export default function Photos({ device }) {
     const [photos, setPhotos] = useState([]);
@@ -82,16 +118,7 @@ export default function Photos({ device }) {
                             }}
                             onClick={() => setSelectedPhoto(photo)}
                         >
-                            <img
-                                src={photo.url}
-                                alt={photo.name}
-                                style={{
-                                    width: '100%',
-                                    height: '200px',
-                                    objectFit: 'cover',
-                                    display: 'block'
-                                }}
-                            />
+                            <PhotoThumb src={photo.url} name={photo.name} />
 
                             {/* Hover Action Gradient Overlay */}
                             <div
