@@ -1,41 +1,48 @@
 import React, { useState, useEffect } from 'react';
-import { Search, User, Phone, MessageSquare, RefreshCw } from 'lucide-react';
+import { Search, User, Phone, MessageSquare } from 'lucide-react';
+import refreshIcon from './icons/refresh_icon.gif';
 
 export default function Contacts({ device }) {
-    const [contacts, setContacts] = useState([
-        { id: 'c1', name: 'Alex Rivera', number: '+1 (555) 321-7654', numbers: ['+1 (555) 321-7654'] },
-        { id: 'c2', name: 'David Miller', number: '+1 (555) 987-6543', numbers: ['+1 (555) 987-6543'] },
-        { id: 'c3', name: 'Emma Watson', number: '+1 (555) 456-7890', numbers: ['+1 (555) 456-7890'] },
-        { id: 'c4', name: 'Sarah Jenkins', number: '+1 (555) 234-5678', numbers: ['+1 (555) 234-5678'] }
-    ]);
-
+    const [contacts, setContacts] = useState([]);
     const [searchQuery, setSearchQuery] = useState('');
     const [isSyncing, setIsSyncing] = useState(false);
 
+    const fetchContacts = () => {
+        setIsSyncing(true);
+        if (window.api && typeof window.api.invoke === 'function') {
+            const res = window.api.invoke('get-contacts');
+            if (res && typeof res.then === 'function') {
+                res.then((list) => {
+                    if (Array.isArray(list)) setContacts(list);
+                })
+                    .catch((err) => console.error(err))
+                    .finally(() => setTimeout(() => setIsSyncing(false), 750));
+            }
+        }
+        if (window.api && window.api.send) {
+            window.api.send('fetch-contacts');
+        }
+    };
+
     useEffect(() => {
+        fetchContacts();
+
         if (window.api && window.api.onContactsUpdated) {
             window.api.onContactsUpdated((list) => {
-                setContacts(list);
+                if (Array.isArray(list)) setContacts(list);
             });
         }
     }, []);
 
-    const handleSync = () => {
-        setIsSyncing(true);
-        if (window.api && window.api.send) {
-            window.api.send('fetch-contacts');
-        }
-        setTimeout(() => setIsSyncing(false), 2000);
-    };
-
     const filteredContacts = contacts.filter(
         (c) =>
-            c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            c.number.includes(searchQuery)
+            (c.name && c.name.toLowerCase().includes(searchQuery.toLowerCase())) ||
+            (c.number && c.number.includes(searchQuery))
     );
 
     const getInitials = (name) => {
-        const parts = name.split(' ');
+        if (!name) return '??';
+        const parts = name.trim().split(' ');
         if (parts.length >= 2) return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
         return name.substring(0, 2).toUpperCase();
     };
@@ -51,8 +58,8 @@ export default function Contacts({ device }) {
                     </p>
                 </div>
 
-                <button className="btn-secondary" onClick={handleSync} disabled={isSyncing}>
-                    <RefreshCw size={14} className={isSyncing ? 'pulse-glow' : ''} />
+                <button className="btn-secondary" onClick={fetchContacts} disabled={isSyncing} style={{ fontSize: '12px', padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <img src={refreshIcon} alt="Refresh" style={{ width: '16px', height: '16px', objectFit: 'contain' }} />
                     <span>{isSyncing ? 'Syncing...' : 'Sync Contacts'}</span>
                 </button>
             </div>
@@ -71,74 +78,80 @@ export default function Contacts({ device }) {
             </div>
 
             {/* Contacts Grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '16px' }}>
-                {filteredContacts.map((c) => (
-                    <div
-                        key={c.id}
-                        className="glass-card animate-fade-in"
-                        style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            padding: '16px'
-                        }}
-                    >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
-                            <div
-                                style={{
-                                    width: '42px',
-                                    height: '42px',
-                                    borderRadius: '50%',
-                                    background: 'linear-gradient(135deg, var(--accent-cyan), var(--accent-blue))',
-                                    color: '#ffffff',
-                                    fontWeight: 700,
-                                    fontSize: '14px',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'center',
-                                    flexShrink: 0
-                                }}
-                            >
-                                {getInitials(c.name)}
-                            </div>
-
-                            <div style={{ minWidth: 0 }}>
+            {filteredContacts.length === 0 ? (
+                <div className="glass-panel" style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                    {contacts.length === 0 ? 'No contacts loaded yet. Tap "Sync Contacts" or ensure Contacts permission is enabled on your phone.' : 'No matching contacts found.'}
+                </div>
+            ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '16px' }}>
+                    {filteredContacts.map((c) => (
+                        <div
+                            key={c.id || c.number}
+                            className="glass-card animate-fade-in"
+                            style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                padding: '16px'
+                            }}
+                        >
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
                                 <div
                                     style={{
-                                        fontWeight: 600,
+                                        width: '42px',
+                                        height: '42px',
+                                        borderRadius: '50%',
+                                        background: 'linear-gradient(135deg, var(--accent-cyan), var(--accent-blue))',
+                                        color: '#ffffff',
+                                        fontWeight: 700,
                                         fontSize: '14px',
-                                        color: 'var(--text-primary)',
-                                        whiteSpace: 'nowrap',
-                                        overflow: 'hidden',
-                                        textOverflow: 'ellipsis'
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        flexShrink: 0
                                     }}
                                 >
-                                    {c.name}
+                                    {getInitials(c.name)}
                                 </div>
-                                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '2px' }}>{c.number}</div>
+
+                                <div style={{ minWidth: 0 }}>
+                                    <div
+                                        style={{
+                                            fontWeight: 600,
+                                            fontSize: '14px',
+                                            color: 'var(--text-primary)',
+                                            whiteSpace: 'nowrap',
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis'
+                                        }}
+                                    >
+                                        {c.name}
+                                    </div>
+                                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '2px' }}>{c.number}</div>
+                                </div>
+                            </div>
+
+                            {/* Quick Actions */}
+                            <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+                                <button
+                                    className="btn-secondary"
+                                    style={{ padding: '8px', borderRadius: 'var(--radius-md)' }}
+                                    title="Send SMS"
+                                >
+                                    <MessageSquare size={15} color="var(--accent-cyan)" />
+                                </button>
+                                <button
+                                    className="btn-secondary"
+                                    style={{ padding: '8px', borderRadius: 'var(--radius-md)' }}
+                                    title="Call Contact"
+                                >
+                                    <Phone size={15} color="var(--accent-emerald)" />
+                                </button>
                             </div>
                         </div>
-
-                        {/* Quick Actions */}
-                        <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
-                            <button
-                                className="btn-secondary"
-                                style={{ padding: '8px', borderRadius: 'var(--radius-md)' }}
-                                title="Send SMS"
-                            >
-                                <MessageSquare size={15} color="var(--accent-cyan)" />
-                            </button>
-                            <button
-                                className="btn-secondary"
-                                style={{ padding: '8px', borderRadius: 'var(--radius-md)' }}
-                                title="Call Contact"
-                            >
-                                <Phone size={15} color="var(--accent-emerald)" />
-                            </button>
-                        </div>
-                    </div>
-                ))}
-            </div>
+                    ))}
+                </div>
+            )}
         </div>
     );
 }

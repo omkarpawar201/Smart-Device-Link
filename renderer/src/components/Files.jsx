@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Folder,
     FileText,
@@ -13,7 +13,11 @@ import {
     Grid,
     List,
     HardDrive,
-    UploadCloud
+    UploadCloud,
+    ArrowUp,
+    RefreshCw,
+    Loader,
+    FolderPlus
 } from 'lucide-react';
 
 export default function Files({ device }) {
@@ -21,32 +25,108 @@ export default function Files({ device }) {
     const [viewMode, setViewMode] = useState('grid');
     const [searchQuery, setSearchQuery] = useState('');
     const [isDraggingOver, setIsDraggingOver] = useState(false);
+    const dragCounter = useRef(0);
     const [isUploading, setIsUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(0);
 
-    const [files, setFiles] = useState([
-        { name: 'DCIM', isDir: true, size: 0, path: '/sdcard/DCIM' },
-        { name: 'Download', isDir: true, size: 0, path: '/sdcard/Download' },
-        { name: 'Documents', isDir: true, size: 0, path: '/sdcard/Documents' },
-        { name: 'Pictures', isDir: true, size: 0, path: '/sdcard/Pictures' },
-        { name: 'Music', isDir: true, size: 0, path: '/sdcard/Music' },
-        { name: 'project_presentation.pdf', isDir: false, size: 4500000, path: '/sdcard/project_presentation.pdf' },
-        { name: 'vacation_photo.jpg', isDir: false, size: 2800000, path: '/sdcard/vacation_photo.jpg' },
-        { name: 'backup_archive.zip', isDir: false, size: 18400000, path: '/sdcard/backup_archive.zip' }
-    ]);
+    const [files, setFiles] = useState([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [storageRoots, setStorageRoots] = useState([]);
+    const [creatingFolder, setCreatingFolder] = useState(false);
+    const [folderName, setFolderName] = useState('');
+
+    const loadDirectory = useCallback((newPath) => {
+        setCurrentPath(newPath);
+        setIsLoading(true);
+        setError('');
+        if (window.api && window.api.invoke) {
+            window.api
+                .invoke('fetch-files', { path: newPath })
+                .then((items) => {
+                    if (Array.isArray(items)) {
+                        setFiles(items);
+                        setError('');
+                    } else {
+                        setError('Could not read this folder.');
+                    }
+                })
+                .catch((err) => {
+                    console.error(err);
+                    setError('Could not read this folder: ' + (err?.message || 'unknown error'));
+                })
+                .finally(() => setIsLoading(false));
+        } else {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            let initialPath = '/sdcard';
+            if (window.api && window.api.invoke) {
+                try {
+                    const roots = await window.api.invoke('list-storage-roots');
+                    if (!cancelled && Array.isArray(roots) && roots.length) {
+                        setStorageRoots(roots);
+                        const preferred = roots.find((r) => r.id === 'internal') || roots[0];
+                        initialPath = preferred.path;
+                    }
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+            if (!cancelled) loadDirectory(initialPath);
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [loadDirectory]);
+
+    const currentRoot = storageRoots.find(
+        (r) => currentPath === r.path || currentPath.startsWith(r.path + '/')
+    ) || null;
+
+    const handleRootChange = (rootPath) => {
+        loadDirectory(rootPath);
+    };
 
     const handleNavigate = (newPath) => {
-        setCurrentPath(newPath);
-        if (window.api && window.api.invoke) {
-            window.api.invoke('fetch-files', { path: newPath }).then((items) => {
-                if (items) setFiles(items);
-            });
-        }
+        loadDirectory(newPath);
+    };
+
+    const handleGoUp = () => {
+        if (!currentPath || currentPath === '/') return;
+        if (currentRoot && currentPath === currentRoot.path) return;
+        const parent = currentPath.substring(0, currentPath.lastIndexOf('/')) || '/';
+        loadDirectory(parent);
     };
 
     const handleDownload = (file) => {
         if (window.api && window.api.send) {
             window.api.send('download-file', { remotePath: file.path, name: file.name });
+        }
+    };
+
+    const handleNewFolderSubmit = async (e) => {
+        e.preventDefault();
+        const safeName = folderName.trim().replace(/[/\\]/g, '_');
+        if (!safeName) return;
+
+        if (window.api && window.api.invoke) {
+            try {
+                const res = await window.api.invoke('create-directory', { path: `${currentPath}/${safeName}` });
+                if (res && res.ok) {
+                    setCreatingFolder(false);
+                    setFolderName('');
+                    loadDirectory(currentPath);
+                } else {
+                    console.error('create-directory failed:', res?.error || 'unknown error');
+                }
+            } catch (err) {
+                console.error(err);
+            }
         }
     };
 
@@ -58,30 +138,43 @@ export default function Files({ device }) {
     };
 
     // Drag and Drop Upload Handlers
+    const handleDragEnter = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounter.current += 1;
+        setIsDraggingOver(true);
+    };
+
     const handleDragOver = (e) => {
         e.preventDefault();
         e.stopPropagation();
-        setIsDraggingOver(true);
     };
 
     const handleDragLeave = (e) => {
         e.preventDefault();
         e.stopPropagation();
-        setIsDraggingOver(false);
+        dragCounter.current -= 1;
+        if (dragCounter.current <= 0) {
+            dragCounter.current = 0;
+            setIsDraggingOver(false);
+        }
     };
 
     const handleDrop = (e) => {
         e.preventDefault();
         e.stopPropagation();
+        dragCounter.current = 0;
         setIsDraggingOver(false);
 
         const droppedFiles = Array.from(e.dataTransfer.files);
         if (droppedFiles.length === 0) return;
 
         setIsUploading(true);
-        setUploadProgress(20);
+        setUploadProgress(0);
 
         droppedFiles.forEach((file, index) => {
+            const localPath = window.api && window.api.getPathForFile ? window.api.getPathForFile(file) : file.path || '';
+
             const newFileObj = {
                 name: file.name,
                 isDir: false,
@@ -91,9 +184,9 @@ export default function Files({ device }) {
 
             setFiles((prev) => [newFileObj, ...prev]);
 
-            if (window.api && window.api.send) {
+            if (localPath && window.api && window.api.send) {
                 window.api.send('upload-file', {
-                    localPath: file.path,
+                    localPath,
                     remoteDirectory: currentPath
                 });
             }
@@ -131,6 +224,7 @@ export default function Files({ device }) {
     return (
         <div
             className="animate-fade-in"
+            onDragEnter={handleDragEnter}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
@@ -154,6 +248,7 @@ export default function Files({ device }) {
                         backdropFilter: 'blur(16px)',
                         border: '2px dashed var(--accent-cyan)',
                         borderRadius: 'var(--radius-lg)',
+                        pointerEvents: 'none',
                         display: 'flex',
                         flexDirection: 'column',
                         alignItems: 'center',
@@ -218,6 +313,48 @@ export default function Files({ device }) {
 
                 {/* View Mode Toggles */}
                 <div style={{ display: 'flex', gap: '8px' }}>
+                    {creatingFolder ? (
+                        <form
+                            onSubmit={handleNewFolderSubmit}
+                            style={{ display: 'flex', gap: '6px', alignItems: 'center' }}
+                        >
+                            <input
+                                className="input-glass"
+                                autoFocus
+                                value={folderName}
+                                onChange={(e) => setFolderName(e.target.value)}
+                                placeholder="Folder name"
+                                style={{ fontSize: '12px', padding: '6px 10px', width: '160px' }}
+                            />
+                            <button type="submit" className="btn-primary" style={{ padding: '6px 12px', fontSize: '12px' }}>
+                                Create
+                            </button>
+                            <button
+                                type="button"
+                                className="btn-secondary"
+                                onClick={() => {
+                                    setCreatingFolder(false);
+                                    setFolderName('');
+                                }}
+                                style={{ padding: '6px 12px', fontSize: '12px' }}
+                            >
+                                Cancel
+                            </button>
+                        </form>
+                    ) : (
+                        <button
+                            className="btn-secondary"
+                            onClick={() => {
+                                setCreatingFolder(true);
+                                setFolderName('');
+                            }}
+                            style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}
+                            title="Create a new folder here"
+                        >
+                            <FolderPlus size={15} color="var(--accent-amber)" />
+                            <span>New Folder</span>
+                        </button>
+                    )}
                     <button
                         className="btn-secondary"
                         onClick={() => setViewMode('grid')}
@@ -255,10 +392,41 @@ export default function Files({ device }) {
                 }}
             >
                 {/* Breadcrumbs */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 500 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 500 }}>
+                    {storageRoots.length > 0 && (
+                        <select
+                            className="input-glass"
+                            value={currentRoot ? currentRoot.path : storageRoots[0].path}
+                            onChange={(e) => handleRootChange(e.target.value)}
+                            title="Select storage"
+                            style={{ fontSize: '12px', padding: '6px 8px', cursor: 'pointer', color: 'var(--text-primary)' }}
+                        >
+                            {storageRoots.map((r) => (
+                                <option key={r.id} value={r.path}>
+                                    {r.name}
+                                </option>
+                            ))}
+                        </select>
+                    )}
+                    <button
+                        className="btn-secondary"
+                        onClick={handleGoUp}
+                        title="Go up one folder"
+                        style={{ padding: '6px', borderRadius: 'var(--radius-sm)' }}
+                    >
+                        <ArrowUp size={15} color="var(--text-secondary)" />
+                    </button>
+                    <button
+                        className="btn-secondary"
+                        onClick={() => loadDirectory(currentPath)}
+                        title="Refresh current folder"
+                        style={{ padding: '6px', borderRadius: 'var(--radius-sm)' }}
+                    >
+                        <RefreshCw size={14} color="var(--text-secondary)" />
+                    </button>
                     <HardDrive size={16} color="var(--accent-cyan)" />
-                    <span onClick={() => handleNavigate('/sdcard')} style={{ cursor: 'pointer', color: 'var(--accent-cyan)' }}>
-                        Internal Storage
+                    <span onClick={() => handleNavigate(currentRoot ? currentRoot.path : '/sdcard')} style={{ cursor: 'pointer', color: 'var(--accent-cyan)' }}>
+                        {currentRoot ? currentRoot.name : 'Internal Storage'}
                     </span>
                     {pathParts.map((part, index) => {
                         const subPath = '/' + pathParts.slice(0, index + 1).join('/');
@@ -294,8 +462,32 @@ export default function Files({ device }) {
                 </div>
             </div>
 
-            {/* Files Grid or List View */}
-            {viewMode === 'grid' ? (
+            {/* Loading State */}
+            {isLoading ? (
+                <div className="glass-panel" style={{ padding: '60px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '14px', color: 'var(--text-muted)' }}>
+                    <Loader size={28} className="spin" color="var(--accent-cyan)" />
+                    <div style={{ fontSize: '13px' }}>Loading {currentPath}...</div>
+                </div>
+            ) : error ? (
+                <div className="glass-panel" style={{ padding: '50px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '14px', textAlign: 'center', color: 'var(--accent-rose)' }}>
+                    <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>{error}</div>
+                    {!device?.connected && (
+                        <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                            No device connected. Pair and connect your phone, then make sure the KDE Connect SFTP plugin has file access.
+                        </div>
+                    )}
+                    <button className="btn-secondary" onClick={() => loadDirectory(currentPath)} style={{ fontSize: '12px', padding: '6px 14px' }}>
+                        <RefreshCw size={13} style={{ marginRight: '6px' }} /> Retry
+                    </button>
+                </div>
+            ) : filteredFiles.length === 0 ? (
+                <div className="glass-panel" style={{ padding: '50px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                    <Folder size={28} color="var(--text-muted)" />
+                    <div style={{ fontSize: '13px' }}>
+                        {searchQuery ? 'No files match your search.' : 'This folder is empty. Drag & drop files here to upload them.'}
+                    </div>
+                </div>
+            ) : viewMode === 'grid' ? (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '14px' }}>
                     {filteredFiles.map((file) => (
                         <div

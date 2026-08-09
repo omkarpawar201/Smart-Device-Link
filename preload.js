@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 // Expose protected window.api object to React renderer process
 contextBridge.exposeInMainWorld('api', {
@@ -21,6 +21,9 @@ contextBridge.exposeInMainWorld('api', {
     onNotificationReceived: (callback) => {
         ipcRenderer.on('notification-received', (event, data) => callback(data));
     },
+    onNotificationDismissed: (callback) => {
+        ipcRenderer.on('notification-dismissed', (event, data) => callback(data));
+    },
     onClipboardReceived: (callback) => {
         ipcRenderer.on('clipboard-received', (event, data) => callback(data));
     },
@@ -40,15 +43,28 @@ contextBridge.exposeInMainWorld('api', {
         ipcRenderer.on('photos-updated', (event, data) => callback(data));
     },
 
+    // Resolve an absolute filesystem path for a File object from a drag/drop or file input
+    // (Electron removed File.path; this is the supported replacement).
+    getPathForFile: (file) => {
+        try {
+            return webUtils.getPathForFile(file);
+        } catch (e) {
+            return '';
+        }
+    },
+
     // General IPC Send / Invoke Bridge
     send: (channel, data) => {
         const validChannels = [
             'send-reply',
             'dismiss-notification',
+            'clear-all-notifications',
             'send-clipboard',
             'media-control',
             'ring-phone',
             'send-sms',
+            'fetch-sms-threads',
+            'fetch-sms-thread-messages',
             'fetch-contacts',
             'share-url',
             'dial-number',
@@ -71,10 +87,17 @@ contextBridge.exposeInMainWorld('api', {
             'pair-device',
             'accept-pair',
             'unpair-device',
-            'fetch-files'
+            'fetch-files',
+            'list-storage-roots',
+            'create-directory',
+            'get-notifications',
+            'get-sms-threads',
+            'get-contacts',
+            'get-photos'
         ];
         if (validChannels.includes(channel)) {
             return ipcRenderer.invoke(channel, data);
         }
+        return Promise.reject(new Error(`Invalid IPC invoke channel: ${channel}`));
     }
 });

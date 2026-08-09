@@ -1,6 +1,9 @@
 import React from 'react';
 import Notifications from './Notifications';
 import Messages from './Messages';
+import Contacts from './Contacts';
+import Photos from './Photos';
+import Files from './Files';
 import Settings from './Settings';
 
 import {
@@ -20,6 +23,9 @@ import {
 export default function ViewContainer({ activeTab, device, notifications, setNotifications }) {
     if (activeTab === 'notifications') return <Notifications device={device} notifications={notifications} setNotifications={setNotifications} />;
     if (activeTab === 'messages') return <Messages device={device} />;
+    if (activeTab === 'contacts') return <Contacts device={device} />;
+    if (activeTab === 'photos') return <Photos device={device} />;
+    if (activeTab === 'files') return <Files device={device} />;
     if (activeTab === 'settings') return <Settings device={device} />;
 
     const placeholderTabs = {

@@ -9,7 +9,11 @@ class SftpPlugin extends BasePlugin {
         this.emitter = eventEmitter;
         this.sftpConfig = null;
         this.sftpClient = null;
+        this.sshClient = null;
         this.isConnected = false;
+        this.currentDevice = null;
+        this.mountRequestInFlight = false;
+        this._mountResetTimer = null;
     }
 
     getCapabilities() {
@@ -19,6 +23,17 @@ class SftpPlugin extends BasePlugin {
     handlePacket(device, packet) {
         if (packet.type === 'kdeconnect.sftp') {
             const body = packet.body || {};
+            this.currentDevice = device;
+            this.mountRequestInFlight = false;
+            if (this._mountResetTimer) {
+                clearTimeout(this._mountResetTimer);
+                this._mountResetTimer = null;
+            }
+
+            if (body.errorMessage) {
+                console.warn(`[SftpPlugin] Device reported SFTP error: ${body.errorMessage}`);
+                return;
+            }
 
             this.sftpConfig = {
                 ip: body.ip || device.info.ip,
@@ -39,6 +54,93 @@ class SftpPlugin extends BasePlugin {
         }
     }
 
+    requestSftpMount(device) {
+        if (!device) return false;
+
+        // The phone regenerates its SFTP password on every startBrowsing request, and responses
+        // can arrive out of order. Sending multiple overlapping requests can therefore leave us
+        // with stale credentials. Only allow one request to be in flight at a time.
+        if (this.mountRequestInFlight) return false;
+        this.mountRequestInFlight = true;
+
+        const requestPacket = {
+            id: Date.now(),
+            type: 'kdeconnect.sftp.request',
+            body: { startBrowsing: true }
+        };
+
+        // Safety net: if the phone never replies, clear the flag so future requests are not blocked.
+        this._mountResetTimer = setTimeout(() => {
+            this.mountRequestInFlight = false;
+            this._mountResetTimer = null;
+        }, 8000);
+
+        console.log(`[SftpPlugin] Requesting SFTP Mount from ${device.info.name}`);
+        return device.sendPacket(requestPacket);
+    }
+
+    async waitForConfig(timeoutMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (!this.sftpConfig && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 200));
+        }
+    }
+
+    _resetSession() {
+        if (this.sshClient) {
+            try { this.sshClient.end(); } catch (e) { /* already closed */ }
+        }
+        this.sshClient = null;
+        this.sftpClient = null;
+        this.isConnected = false;
+    }
+
+    // Runs an operation against the SFTP session, re-establishing the connection once
+    // if the existing session turns out to be dead/stale (phone idle, Wi-Fi flap, etc.).
+    async withSession(device, fn) {
+        let attempt = 0;
+        for (;;) {
+            const sftp = await this.ensureSftpSession(device);
+            try {
+                return await fn(sftp);
+            } catch (err) {
+                if (attempt++ === 0 && !this.isConnected) {
+                    this._resetSession();
+                    continue;
+                }
+                throw err;
+            }
+        }
+    }
+
+    async ensureSftpSession(device) {
+        const dev = device || this.currentDevice;
+        if (this.sftpClient && this.isConnected) return this.sftpClient;
+
+        if (!this.sftpConfig) {
+            if (!dev) throw new Error('No device available to request SFTP credentials');
+            this.requestSftpMount(dev);
+            await this.waitForConfig(6000);
+            if (!this.sftpConfig) throw new Error('SFTP credentials not received within timeout');
+        }
+
+        try {
+            await this.connectSftp();
+        } catch (err) {
+            // The stored password may be stale (the phone regenerates it per request). Invalidate
+            // the config, fetch fresh credentials, and retry once before giving up.
+            this._resetSession();
+            this.sftpConfig = null;
+            if (!dev) throw err;
+            this.requestSftpMount(dev);
+            await this.waitForConfig(6000);
+            if (!this.sftpConfig) throw err;
+            await this.connectSftp();
+        }
+
+        return this.sftpClient;
+    }
+
     connectSftp(configOverride) {
         return new Promise((resolve, reject) => {
             const config = configOverride || this.sftpConfig;
@@ -48,6 +150,7 @@ class SftpPlugin extends BasePlugin {
 
             conn.on('ready', () => {
                 console.log(`[SftpPlugin] SSH2 Client Ready. Opening SFTP session...`);
+                this.sshClient = conn;
                 conn.sftp((err, sftp) => {
                     if (err) {
                         conn.end();
@@ -60,9 +163,17 @@ class SftpPlugin extends BasePlugin {
             });
 
             conn.on('error', (err) => {
-                console.error('[SftpPlugin] SSH2 Error:', err.message);
+                console.error(`[SftpPlugin] SSH2 Error: ${err.message} (${config.ip}:${config.port} user=${config.user})`);
                 this.isConnected = false;
                 reject(err);
+            });
+
+            conn.on('close', () => {
+                if (this.sshClient === conn) {
+                    this.isConnected = false;
+                    this.sftpClient = null;
+                    this.sshClient = null;
+                }
             });
 
             conn.connect({
@@ -76,10 +187,8 @@ class SftpPlugin extends BasePlugin {
     }
 
     async listDirectory(remotePath = '/sdcard') {
-        if (!this.sftpClient) await this.connectSftp();
-
-        return new Promise((resolve, reject) => {
-            this.sftpClient.readdir(remotePath, (err, list) => {
+        return this.withSession(this.currentDevice, (sftp) => new Promise((resolve, reject) => {
+            sftp.readdir(remotePath, (err, list) => {
                 if (err) return reject(err);
 
                 const items = list.map((item) => ({
@@ -98,65 +207,44 @@ class SftpPlugin extends BasePlugin {
 
                 resolve(items);
             });
-        });
+        }));
     }
 
     async downloadFile(remoteFilePath, localFilePath) {
-        if (!this.sftpClient) await this.connectSftp();
-
-        return new Promise((resolve, reject) => {
-            this.sftpClient.fastGet(remoteFilePath, localFilePath, (err) => {
+        return this.withSession(this.currentDevice, (sftp) => new Promise((resolve, reject) => {
+            sftp.fastGet(remoteFilePath, localFilePath, (err) => {
                 if (err) return reject(err);
                 resolve(localFilePath);
             });
-        });
+        }));
     }
 
     async uploadFile(localFilePath, remoteFilePath) {
-        if (!this.sftpClient) await this.connectSftp();
-
-        return new Promise((resolve, reject) => {
-            this.sftpClient.fastPut(localFilePath, remoteFilePath, (err) => {
+        return this.withSession(this.currentDevice, (sftp) => new Promise((resolve, reject) => {
+            sftp.fastPut(localFilePath, remoteFilePath, (err) => {
                 if (err) return reject(err);
                 resolve(remoteFilePath);
             });
-        });
+        }));
     }
 
     async deleteItem(remotePath, isDirectory = false) {
-        if (!this.sftpClient) await this.connectSftp();
-
-        return new Promise((resolve, reject) => {
-            const action = isDirectory ? this.sftpClient.rmdir.bind(this.sftpClient) : this.sftpClient.unlink.bind(this.sftpClient);
+        return this.withSession(this.currentDevice, (sftp) => new Promise((resolve, reject) => {
+            const action = isDirectory ? sftp.rmdir.bind(sftp) : sftp.unlink.bind(sftp);
             action(remotePath, (err) => {
                 if (err) return reject(err);
                 resolve(true);
             });
-        });
+        }));
     }
 
     async createDirectory(remotePath) {
-        if (!this.sftpClient) await this.connectSftp();
-
-        return new Promise((resolve, reject) => {
-            this.sftpClient.mkdir(remotePath, (err) => {
+        return this.withSession(this.currentDevice, (sftp) => new Promise((resolve, reject) => {
+            sftp.mkdir(remotePath, (err) => {
                 if (err) return reject(err);
                 resolve(true);
             });
-        });
-    }
-
-    requestSftpMount(device) {
-        if (!device) return false;
-
-        const requestPacket = {
-            id: Date.now(),
-            type: 'kdeconnect.sftp.request',
-            body: { startBrowsing: true }
-        };
-
-        console.log(`[SftpPlugin] Requesting SFTP Mount from ${device.info.name}`);
-        return device.sendPacket(requestPacket);
+        }));
     }
 }
 

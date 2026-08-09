@@ -43,6 +43,7 @@ class NotificationPlugin extends BasePlugin {
                 id: notifId,
                 deviceId: device.info.id,
                 appName: body.appName || 'Android App',
+                packageName: body.packageName || '',
                 title: title,
                 text: text,
                 ticker: body.ticker || '',
@@ -57,7 +58,10 @@ class NotificationPlugin extends BasePlugin {
             if (this.emitter) {
                 this.emitter.emit('notificationReceived', notifData);
                 const appLower = (notifData.appName || '').toLowerCase();
-                if (appLower.includes('message') || appLower.includes('sms') || appLower.includes('messaging')) {
+                const pkgLower = (notifData.packageName || '').toLowerCase();
+                const isSmsApp = appLower.includes('message') || appLower.includes('sms') || appLower.includes('messaging')
+                    || pkgLower.includes('messaging') || pkgLower.includes('mms') || pkgLower.includes('sms') || pkgLower.includes('messages');
+                if (isSmsApp) {
                     this.emitter.emit('smsNotificationReceived', notifData);
                 }
             }

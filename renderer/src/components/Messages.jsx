@@ -1,50 +1,64 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Send, Search, User, Phone, CheckCheck } from 'lucide-react';
+import { MessageSquare, Send, Search, User, Phone, CheckCheck, RefreshCw } from 'lucide-react';
+import refreshIcon from './icons/refresh_icon.gif';
 
 export default function Messages({ device }) {
-    const [threads, setThreads] = useState([
-        {
-            threadId: 't1',
-            address: '+1 (555) 234-5678',
-            contactName: 'Sarah Jenkins',
-            lastMessage: 'Sounds good! See you tomorrow at the office.',
-            lastDate: Date.now() - 1000 * 60 * 12,
-            messages: [
-                { id: 'm1', body: 'Hey! Are we still reviewing the proposal?', date: Date.now() - 1000 * 60 * 30, type: 1 },
-                { id: 'm2', body: 'Yes, I just finished revising section 3.', date: Date.now() - 1000 * 60 * 20, type: 2 },
-                { id: 'm3', body: 'Sounds good! See you tomorrow at the office.', date: Date.now() - 1000 * 60 * 12, type: 1 }
-            ]
-        },
-        {
-            threadId: 't2',
-            address: '+1 (555) 987-6543',
-            contactName: 'David Miller',
-            lastMessage: 'Can you send over the updated PDF file?',
-            lastDate: Date.now() - 1000 * 60 * 120,
-            messages: [
-                { id: 'm4', body: 'Can you send over the updated PDF file?', date: Date.now() - 1000 * 60 * 120, type: 1 }
-            ]
-        }
-    ]);
-
-    const [activeThreadId, setActiveThreadId] = useState('t1');
+    const [threads, setThreads] = useState([]);
+    const [activeThreadId, setActiveThreadId] = useState(null);
     const [inputText, setInputText] = useState('');
     const [searchQuery, setSearchQuery] = useState('');
+    const [isRefreshing, setIsRefreshing] = useState(false);
     const messagesEndRef = useRef(null);
+    const activeThreadIdRef = useRef(null);
 
-    const activeThread = threads.find((t) => t.threadId === activeThreadId) || threads[0];
+    const fetchThreads = () => {
+        setIsRefreshing(true);
+        if (window.api && typeof window.api.invoke === 'function') {
+            const res = window.api.invoke('get-sms-threads');
+            if (res && typeof res.then === 'function') {
+                res.then((list) => {
+                    if (Array.isArray(list)) setThreads(list);
+                })
+                    .catch((err) => console.error(err))
+                    .finally(() => setTimeout(() => setIsRefreshing(false), 750));
+            }
+        }
+        if (window.api && window.api.send) {
+            window.api.send('fetch-sms-threads');
+        }
+    };
 
     useEffect(() => {
+        activeThreadIdRef.current = activeThreadId;
+    }, [activeThreadId]);
+
+    useEffect(() => {
+        fetchThreads();
+
         if (window.api && window.api.onSmsThreadsUpdated) {
             window.api.onSmsThreadsUpdated((updatedThreads) => {
-                setThreads(updatedThreads);
+                if (Array.isArray(updatedThreads)) {
+                    setThreads(updatedThreads);
+                    if (!activeThreadIdRef.current && updatedThreads.length > 0) {
+                        setActiveThreadId(updatedThreads[0].threadId);
+                    }
+                }
             });
         }
     }, []);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [activeThreadId, activeThread?.messages]);
+    }, [activeThreadId, threads]);
+
+    useEffect(() => {
+        if (activeThreadId && window.api && window.api.send) {
+            window.api.send('fetch-sms-thread-messages', { threadId: activeThreadId });
+        }
+    }, [activeThreadId]);
+
+
+    const activeThread = threads.find((t) => t.threadId === activeThreadId) || threads[0];
 
     const handleSendMessage = () => {
         if (!inputText.trim() || !activeThread) return;
@@ -73,7 +87,7 @@ export default function Messages({ device }) {
                         ...t,
                         lastMessage: newMsg.body,
                         lastDate: newMsg.date,
-                        messages: [...t.messages, newMsg]
+                        messages: [...(t.messages || []), newMsg]
                     };
                 }
                 return t;
@@ -85,12 +99,13 @@ export default function Messages({ device }) {
 
     const filteredThreads = threads.filter(
         (t) =>
-            t.contactName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            t.address.includes(searchQuery) ||
-            t.lastMessage.toLowerCase().includes(searchQuery.toLowerCase())
+            (t.contactName && t.contactName.toLowerCase().includes(searchQuery.toLowerCase())) ||
+            (t.address && t.address.includes(searchQuery)) ||
+            (t.lastMessage && t.lastMessage.toLowerCase().includes(searchQuery.toLowerCase()))
     );
 
     const formatTime = (ts) => {
+        if (!ts) return '';
         const d = new Date(ts);
         return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     };
@@ -117,7 +132,13 @@ export default function Messages({ device }) {
                     gap: '12px'
                 }}
             >
-                <div style={{ fontWeight: 700, fontSize: '18px', color: 'var(--text-primary)' }}>Messages</div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ fontWeight: 700, fontSize: '18px', color: 'var(--text-primary)' }}>Messages</div>
+                    <button className="btn-secondary" onClick={fetchThreads} disabled={isRefreshing} style={{ fontSize: '11px', padding: '4px 8px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <img src={refreshIcon} alt="Refresh" style={{ width: '14px', height: '14px', objectFit: 'contain' }} />
+                        <span>{isRefreshing ? 'Syncing...' : 'Sync'}</span>
+                    </button>
+                </div>
 
                 {/* Search Bar */}
                 <div style={{ position: 'relative' }}>
@@ -134,41 +155,47 @@ export default function Messages({ device }) {
 
                 {/* Threads List */}
                 <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                    {filteredThreads.map((t) => {
-                        const isActive = t.threadId === activeThreadId;
-                        return (
-                            <div
-                                key={t.threadId}
-                                onClick={() => setActiveThreadId(t.threadId)}
-                                style={{
-                                    padding: '12px',
-                                    borderRadius: 'var(--radius-md)',
-                                    background: isActive ? 'rgba(56, 189, 248, 0.15)' : 'rgba(255, 255, 255, 0.03)',
-                                    border: isActive ? '1px solid var(--border-glow)' : '1px solid transparent',
-                                    cursor: 'pointer',
-                                    transition: 'all 0.2s ease'
-                                }}
-                            >
-                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                                    <span style={{ fontWeight: 600, fontSize: '14px', color: isActive ? 'var(--accent-cyan)' : 'var(--text-primary)' }}>
-                                        {t.contactName}
-                                    </span>
-                                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{formatTime(t.lastDate)}</span>
-                                </div>
+                    {filteredThreads.length === 0 ? (
+                        <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '13px' }}>
+                            {threads.length === 0 ? 'No SMS conversations synced yet. Ensure SMS permission is enabled on phone.' : 'No matching conversations.'}
+                        </div>
+                    ) : (
+                        filteredThreads.map((t) => {
+                            const isActive = t.threadId === activeThreadId;
+                            return (
                                 <div
+                                    key={t.threadId}
+                                    onClick={() => setActiveThreadId(t.threadId)}
                                     style={{
-                                        fontSize: '12px',
-                                        color: 'var(--text-secondary)',
-                                        whiteSpace: 'nowrap',
-                                        overflow: 'hidden',
-                                        textOverflow: 'ellipsis'
+                                        padding: '12px',
+                                        borderRadius: 'var(--radius-md)',
+                                        background: isActive ? 'rgba(56, 189, 248, 0.15)' : 'rgba(255, 255, 255, 0.03)',
+                                        border: isActive ? '1px solid var(--border-glow)' : '1px solid transparent',
+                                        cursor: 'pointer',
+                                        transition: 'all 0.2s ease'
                                     }}
                                 >
-                                    {t.lastMessage}
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                        <span style={{ fontWeight: 600, fontSize: '14px', color: isActive ? 'var(--accent-cyan)' : 'var(--text-primary)' }}>
+                                            {t.contactName || t.address}
+                                        </span>
+                                        <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{formatTime(t.lastDate)}</span>
+                                    </div>
+                                    <div
+                                        style={{
+                                            fontSize: '12px',
+                                            color: 'var(--text-secondary)',
+                                            whiteSpace: 'nowrap',
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis'
+                                        }}
+                                    >
+                                        {t.lastMessage}
+                                    </div>
                                 </div>
-                            </div>
-                        );
-                    })}
+                            );
+                        })
+                    )}
                 </div>
             </div>
 
@@ -211,20 +238,15 @@ export default function Messages({ device }) {
                                 <User size={20} />
                             </div>
                             <div>
-                                <div style={{ fontWeight: 600, fontSize: '15px' }}>{activeThread.contactName}</div>
+                                <div style={{ fontWeight: 600, fontSize: '15px' }}>{activeThread.contactName || activeThread.address}</div>
                                 <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{activeThread.address}</div>
                             </div>
                         </div>
-
-                        <button className="btn-secondary" style={{ padding: '8px 12px', fontSize: '12px' }}>
-                            <Phone size={14} />
-                            <span>Call</span>
-                        </button>
                     </div>
 
                     {/* Messages Bubble Area */}
                     <div style={{ flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                        {activeThread.messages.map((m) => {
+                        {(activeThread.messages || []).map((m) => {
                             const isOutgoing = m.type === 2;
                             return (
                                 <div
@@ -283,7 +305,7 @@ export default function Messages({ device }) {
                         <input
                             type="text"
                             className="input-glass"
-                            placeholder={`Send SMS to ${activeThread.contactName}...`}
+                            placeholder={`Send SMS to ${activeThread.contactName || activeThread.address}...`}
                             value={inputText}
                             onChange={(e) => setInputText(e.target.value)}
                             onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
@@ -296,7 +318,7 @@ export default function Messages({ device }) {
                 </div>
             ) : (
                 <div className="glass-panel" style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <div style={{ color: 'var(--text-muted)' }}>Select a conversation to view messages</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '14px' }}>Select a conversation from the left to view messages</div>
                 </div>
             )}
         </div>

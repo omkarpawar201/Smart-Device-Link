@@ -8,28 +8,93 @@ class SmsPlugin extends BasePlugin {
     }
 
     getCapabilities() {
+        // Note: kdeconnect.notification is intentionally NOT registered here. SmsPlugin only
+        // turns SMS-app notifications into threads, and those arrive already-filtered via the
+        // bridge's smsNotificationReceived forwarding. Registering for the raw packet would
+        // create a fake thread for every notification (Google Photos, etc.).
         return ['kdeconnect.sms.messages', 'kdeconnect.sms.request'];
     }
 
     handlePacket(device, packet) {
-        if (packet.type === 'kdeconnect.sms.messages') {
+        console.log(`[SmsPlugin] Packet received: ${packet.type} (keys: ${Object.keys(packet.body || {}).join(', ')})`);
+
+        if (packet.type === 'kdeconnect.sms.messages' || packet.type === 'kdeconnect.sms.request') {
             const body = packet.body || {};
-            const rawMessages = body.messages || [];
+            const rawMessages = body.messages || body.conversations || body.threads || [];
 
-            console.log(`[SmsPlugin] Received ${rawMessages.length} SMS messages from ${device.info.name}`);
+            if (rawMessages.length > 0) {
+                console.log(`[SmsPlugin] Processing ${rawMessages.length} SMS items from ${device.info.name}`);
 
-            rawMessages.forEach((msg) => {
-                const threadId = msg.thread_id || msg.threadId || (msg.addresses && msg.addresses[0] ? msg.addresses[0].address : 'default');
-                const address = (msg.addresses && msg.addresses[0]) ? msg.addresses[0].address : (msg.address || 'Unknown');
-                const text = msg.body || '';
-                const timestamp = msg.date || Date.now();
-                const type = msg.type || 1; // 1 = Received, 2 = Sent
+                rawMessages.forEach((msg) => {
+                    const threadId = (msg.thread_id !== undefined && msg.thread_id !== null)
+                        ? msg.thread_id
+                        : ((msg.threadId !== undefined && msg.threadId !== null)
+                            ? msg.threadId
+                            : (msg.addresses && msg.addresses[0] ? (msg.addresses[0].address || msg.addresses[0]) : 'default'));
+                    const address = (msg.addresses && msg.addresses[0]) ? (msg.addresses[0].address || msg.addresses[0]) : (msg.address || 'Unknown');
+                    const text = msg.body || msg.messageBody || '';
+                    const timestamp = msg.date || msg.time || Date.now();
+                    const type = msg.type || 1; // 1 = Received, 2 = Sent
+
+                    if (!this.threads.has(threadId)) {
+                        this.threads.set(threadId, {
+                            threadId: threadId,
+                            address: String(address),
+                            contactName: String(address),
+                            lastMessage: text,
+                            lastDate: timestamp,
+                            messages: []
+                        });
+                    }
+
+                    const thread = this.threads.get(threadId);
+                    if (timestamp >= thread.lastDate) {
+                        thread.lastDate = timestamp;
+                        thread.lastMessage = text;
+                    }
+
+                    const msgObj = {
+                        id: msg._id || msg.id || `sms_${timestamp}_${Math.random().toString(36).substr(2, 4)}`,
+                        threadId: threadId,
+                        address: String(address),
+                        body: text,
+                        date: timestamp,
+                        type: type
+                    };
+
+                    if (!thread.messages.some((m) => m.id === msgObj.id || (m.body === msgObj.body && m.date === msgObj.date))) {
+                        thread.messages.push(msgObj);
+                        thread.messages.sort((a, b) => a.date - b.date);
+                    }
+                });
+
+                if (this.emitter) {
+                    this.emitter.emit('smsThreadsUpdated', this.getThreadsList());
+                }
+            }
+        } else if (packet.type === 'kdeconnect.notification') {
+            const body = packet.body || {};
+            const appName = (body.appName || '').toLowerCase();
+            const packageName = (body.packageName || '').toLowerCase();
+            const isSmsApp = appName.includes('message') || appName.includes('sms') || appName.includes('messaging')
+                || packageName.includes('messaging') || packageName.includes('mms') || packageName.includes('sms') || packageName.includes('messages');
+
+            // Only SMS/Messaging apps may create threads in the Messages view.
+            if (!isSmsApp) return;
+
+            if (!body.isCancel && body.text) {
+                const contactOrNum = body.title || 'SMS Contact';
+                const threadId = `thread_${contactOrNum.replace(/\s+/g, '_')}`;
+                const timestamp = Date.now();
+                const text = body.text;
+
+                console.log(`[SmsPlugin] Incoming SMS notification: ${contactOrNum} - "${text}"`);
 
                 if (!this.threads.has(threadId)) {
                     this.threads.set(threadId, {
                         threadId: threadId,
-                        address: address,
-                        contactName: address,
+                        address: contactOrNum,
+                        contactName: contactOrNum,
                         lastMessage: text,
                         lastDate: timestamp,
                         messages: []
@@ -38,26 +103,25 @@ class SmsPlugin extends BasePlugin {
 
                 const thread = this.threads.get(threadId);
                 thread.lastMessage = text;
-                thread.lastDate = Math.max(thread.lastDate, timestamp);
+                thread.lastDate = timestamp;
 
                 const msgObj = {
-                    id: msg._id || `sms_${timestamp}_${Math.random().toString(36).substr(2, 4)}`,
+                    id: body.id || `sms_${timestamp}`,
                     threadId: threadId,
-                    address: address,
+                    address: contactOrNum,
                     body: text,
                     date: timestamp,
-                    type: type // 1: Incoming, 2: Outgoing
+                    type: 1 // Incoming
                 };
 
-                // Avoid duplicates
-                if (!thread.messages.some((m) => m.id === msgObj.id || (m.body === msgObj.body && m.date === msgObj.date))) {
+                if (!thread.messages.some((m) => m.id === msgObj.id || (m.body === msgObj.body && Math.abs(m.date - msgObj.date) < 2000))) {
                     thread.messages.push(msgObj);
                     thread.messages.sort((a, b) => a.date - b.date);
                 }
-            });
 
-            if (this.emitter) {
-                this.emitter.emit('smsThreadsUpdated', this.getThreadsList());
+                if (this.emitter) {
+                    this.emitter.emit('smsThreadsUpdated', this.getThreadsList());
+                }
             }
         }
     }
@@ -75,6 +139,37 @@ class SmsPlugin extends BasePlugin {
             }
         };
 
+        const threadId = `thread_${phoneNumber.replace(/\s+/g, '_')}`;
+        const timestamp = Date.now();
+
+        if (!this.threads.has(threadId)) {
+            this.threads.set(threadId, {
+                threadId: threadId,
+                address: phoneNumber,
+                contactName: phoneNumber,
+                lastMessage: messageText,
+                lastDate: timestamp,
+                messages: []
+            });
+        }
+
+        const thread = this.threads.get(threadId);
+        thread.lastMessage = messageText;
+        thread.lastDate = timestamp;
+
+        thread.messages.push({
+            id: `sms_sent_${timestamp}`,
+            threadId: threadId,
+            address: phoneNumber,
+            body: messageText,
+            date: timestamp,
+            type: 2 // Outgoing
+        });
+
+        if (this.emitter) {
+            this.emitter.emit('smsThreadsUpdated', this.getThreadsList());
+        }
+
         console.log(`[SmsPlugin] Sending SMS to ${phoneNumber} via ${device.info.name}: "${messageText}"`);
         return device.sendPacket(smsPacket);
     }
@@ -82,14 +177,36 @@ class SmsPlugin extends BasePlugin {
     requestAllThreads(device) {
         if (!device) return false;
 
+        console.log(`[SmsPlugin] Requesting SMS conversation list from ${device.info.name}`);
+
+        // Modern KDE Connect protocol: "request the most-recent message in every conversation".
+        // Current kdeconnect-android builds no longer answer "requestConversationTable" packets
+        // (they treat every kdeconnect.sms.request as a send request), so this dedicated packet
+        // type is required.
+        return device.sendPacket({
+            id: Date.now(),
+            type: 'kdeconnect.sms.request_conversations',
+            body: {}
+        });
+    }
+
+    requestThreadMessages(device, threadId) {
+        if (!device || threadId === undefined || threadId === null) return false;
+
+        // Only real phone threads (numeric thread ids) can be fetched. Synthetic threads
+        // created from SMS notifications / optimistic sends have no counterpart on the device.
+        const numericThreadId = Number(threadId);
+        if (!Number.isFinite(numericThreadId)) return false;
+
         const requestPacket = {
             id: Date.now(),
-            type: 'kdeconnect.sms.request',
+            type: 'kdeconnect.sms.request_conversation',
             body: {
-                requestConversationTable: true
+                threadID: numericThreadId
             }
         };
 
+        console.log(`[SmsPlugin] Requesting full thread history for thread ${numericThreadId} from ${device.info.name}`);
         return device.sendPacket(requestPacket);
     }
 

@@ -1,5 +1,7 @@
-const { ipcMain } = require('electron');
+const { ipcMain, app } = require('electron');
 const EventEmitter = require('events');
+const fs = require('fs');
+const path = require('path');
 const CryptoHelper = require('../kdeconnect/CryptoHelper');
 const DeviceManager = require('../kdeconnect/DeviceManager');
 const Device = require('../kdeconnect/Device');
@@ -166,6 +168,7 @@ function initKDEConnectBridge(mainWindow) {
         console.log(`[Bridge] Incoming TLS Connection accepted from ${tlsSocket.remoteAddress} (${deviceName})`);
 
         let tempDev = activeDeviceConnections.get(deviceId);
+        const isReused = !!tempDev;
 
         if (tempDev) {
             console.log(`[Bridge] Reusing connection for ${deviceName} (${deviceId})`);
@@ -173,17 +176,9 @@ function initKDEConnectBridge(mainWindow) {
             tempDev.socket = null;
             tempDev.buffer = '';
 
-            // Detach the old socket gracefully. Do NOT use an abrupt destroy() here:
-            // the phone reconnects rapidly (link.reset churn) and often reuses the
-            // same TCP source port, so an RST/FIN from closing the stale socket can
-            // corrupt the fresh connection. end() flushes and sends FIN; a destroy()
-            // fallback guarantees the fd is freed even if the peer never ACKs.
             if (oldSocket) {
-                // Strip EVERY listener (data, close, error, end, timeout, secure):
-                // a late 'end'/'timeout' on this dying socket must not call
-                // handleDisconnect, which would destroy the freshly attached socket.
                 oldSocket.removeAllListeners();
-                oldSocket.on('error', () => { }); // swallow late teardown errors
+                oldSocket.on('error', () => { });
                 const teardownTimer = setTimeout(() => oldSocket.destroy(), 1000);
                 oldSocket.once('close', () => clearTimeout(teardownTimer));
                 try {
@@ -219,7 +214,6 @@ function initKDEConnectBridge(mainWindow) {
             activeDeviceConnections.set(deviceId, tempDev);
         }
 
-        // Attach disconnect listener once per Device instance
         if (!tempDev.hasDisconnectListener) {
             tempDev.hasDisconnectListener = true;
             tempDev.on('disconnected', () => {
@@ -237,7 +231,6 @@ function initKDEConnectBridge(mainWindow) {
             });
         }
 
-        // Attach new socket & listeners
         tempDev.socket = tlsSocket;
         tempDev.connected = true;
         tempDev.lastPacketAt = Date.now();
@@ -260,9 +253,14 @@ function initKDEConnectBridge(mainWindow) {
             });
         }
 
-        // Request battery and connectivity reports immediately on connection
+        // Request battery, connectivity, notifications, SMS threads, and contacts on initial connection
         if (batteryPlugin) batteryPlugin.requestBatteryStatus(tempDev);
         if (connectivityPlugin) connectivityPlugin.requestReport(tempDev);
+        if (!isReused) {
+            if (notificationPlugin) notificationPlugin.requestAllNotifications(tempDev);
+            if (smsPlugin) smsPlugin.requestAllThreads(tempDev);
+            if (contactsPlugin) contactsPlugin.requestAllContacts(tempDev);
+        }
     });
 
 
@@ -319,10 +317,30 @@ function initKDEConnectBridge(mainWindow) {
     });
 
 
-    // Forward Plugin Events to React Renderer
+    // Forward Notification Events
     pluginEvents.on('notificationReceived', (data) => {
-        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('notification-received', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('notification-received', data);
+        }
     });
+
+    pluginEvents.on('notificationDismissed', (data) => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('notification-dismissed', data);
+        }
+    });
+
+    ipcMain.handle('get-notifications', () => {
+        return notificationPlugin ? notificationPlugin.getNotifications() : [];
+    });
+
+    ipcMain.on('clear-all-notifications', () => {
+        if (notificationPlugin) {
+            const activeDev = getFirstActiveDevice();
+            notificationPlugin.clearAllNotifications(activeDev);
+        }
+    });
+
 
     pluginEvents.on('batteryStateChanged', (data) => {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('device-status-changed', { battery: data.charge, isCharging: data.isCharging });
@@ -355,8 +373,32 @@ function initKDEConnectBridge(mainWindow) {
     });
 
     pluginEvents.on('contactsUpdated', (data) => {
-        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('contacts-updated', data);
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('contacts-updated', data);
+        }
     });
+
+    pluginEvents.on('smsNotificationReceived', (data) => {
+        const activeDev = getFirstActiveDevice();
+        if (smsPlugin && activeDev) {
+            smsPlugin.handlePacket(activeDev, {
+                type: 'kdeconnect.notification',
+                body: {
+                    appName: data.appName,
+                    packageName: data.packageName,
+                    title: data.title,
+                    text: data.text,
+                    id: data.id
+                }
+            });
+        }
+    });
+
+    ipcMain.on('fetch-sms-thread-messages', (event, { threadId }) => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && smsPlugin) smsPlugin.requestThreadMessages(activeDev, threadId);
+    });
+
 
     // HFP Bluetooth Events
     hfpProtocol.on('incomingCallRinging', () => {
@@ -412,12 +454,104 @@ function initKDEConnectBridge(mainWindow) {
         }
     });
 
-    ipcMain.on('download-file', async (event, { remotePath, name }) => {
+    // Discovers the phone's available storage roots (internal storage and any SD cards)
+    // by probing Android mount points through SFTP.
+    ipcMain.handle('list-storage-roots', async () => {
         const activeDev = getFirstActiveDevice();
-        if (activeDev) {
-            const desktopPath = require('path').join(require('os').homedir(), 'Desktop', name);
-            await sftpPlugin.downloadFile(remotePath, desktopPath);
+        if (!activeDev || !sftpPlugin) return [];
+
+        const roots = [];
+        const seen = new Set();
+
+        const tryAdd = (id, name, path) => {
+            if (!path || seen.has(path)) return;
+            seen.add(path);
+            roots.push({ id, name, path });
+        };
+
+        const readable = async (p) => {
+            try {
+                await sftpPlugin.listDirectory(p);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        };
+
+        // Directories under /storage that are internal-storage mounts (NOT SD cards).
+        const INTERNAL_DIR = /^(emulated|self|primary|sdcard|sdcard0)$/i;
+
+        const isInternalPath = (p) => {
+            if (p === internalPath) return true;
+            return /^\/(sdcard|mnt\/sdcard|storage\/emulated\/0|storage\/self\/primary)$/.test(p);
+        };
+
+        // Resolve the internal storage root once, so only one "Internal Storage" entry is shown.
+        let internalPath = null;
+        for (const candidate of ['/sdcard', '/storage/emulated/0', '/storage/self/primary', '/mnt/sdcard']) {
+            if (await readable(candidate)) {
+                internalPath = candidate;
+                break;
+            }
         }
+        if (internalPath) tryAdd('internal', 'Internal Storage', internalPath);
+
+        const classifySD = async (p) => {
+            if (!p || seen.has(p) || isInternalPath(p)) return;
+            if (await readable(p)) {
+                tryAdd(`sd_${p.replace(/[^a-zA-Z0-9]+/g, '_')}`, 'SD Card', p);
+            }
+        };
+
+        // Scan /storage for removable SD cards (everything there that isn't internal storage).
+        try {
+            const entries = await sftpPlugin.listDirectory('/storage');
+            for (const entry of entries) {
+                if (!entry.isDir) continue;
+                if (INTERNAL_DIR.test(entry.name)) continue;
+                await classifySD(`/storage/${entry.name}`);
+            }
+        } catch (e) {
+            // SFTP root may be chrooted to a single folder, so /storage is not listable;
+            // fall through to the other mount locations below.
+        }
+
+        // Physical SD card mounts live under /mnt/media_rw (UUID-style dirs).
+        try {
+            const entries = await sftpPlugin.listDirectory('/mnt/media_rw');
+            for (const entry of entries) {
+                if (!entry.isDir) continue;
+                await classifySD(`/mnt/media_rw/${entry.name}`);
+            }
+        } catch (e) {
+            // not listable
+        }
+
+        // Common well-known removable storage paths.
+        for (const p of [
+            '/storage/sdcard1',
+            '/storage/extSdCard',
+            '/storage/external_sd',
+            '/storage/ext_sd',
+            '/mnt/sdcard1',
+            '/mnt/extSdCard',
+            '/mnt/external_sd',
+            '/mnt/ext_sd',
+            '/mnt/expand'
+        ]) {
+            await classifySD(p);
+        }
+
+        // The SFTP plugin's configured root always works, so surface it if it isn't internal.
+        if (sftpPlugin.sftpConfig && sftpPlugin.sftpConfig.path) {
+            const cfgPath = sftpPlugin.sftpConfig.path;
+            if (cfgPath && cfgPath !== internalPath && !isInternalPath(cfgPath)) {
+                await classifySD(cfgPath);
+            }
+        }
+
+        console.log(`[Bridge] Storage roots (internal=${internalPath || 'none'}):`, roots.map((r) => `${r.name}@${r.path}`).join(', ') || 'none');
+        return roots;
     });
 
     ipcMain.on('upload-file', async (event, { localPath, remoteDirectory }) => {
@@ -433,29 +567,106 @@ function initKDEConnectBridge(mainWindow) {
         if (activeDev) await sftpPlugin.deleteItem(remotePath, isDir);
     });
 
-    ipcMain.on('scan-photos', async () => {
-        const activeDev = getFirstActiveDevice();
-        if (activeDev) {
-            try {
-                const dcimFiles = await sftpPlugin.listDirectory('/sdcard/DCIM/Camera');
-                if (currentMainWindow && !currentMainWindow.isDestroyed()) {
-                    currentMainWindow.webContents.send('photos-updated', dcimFiles);
-                }
-            } catch (e) {
-                console.warn('[Bridge] scan-photos failed:', e.message);
-            }
+    ipcMain.handle('create-directory', async (event, { path: remotePath }) => {
+        if (!remotePath) return { ok: false, error: 'No path provided' };
+        try {
+            await sftpPlugin.createDirectory(remotePath);
+            return { ok: true };
+        } catch (e) {
+            return { ok: false, error: e.message };
         }
     });
 
-    // Messaging & Contacts Handlers
+
+    // Photos & SFTP Handlers
+    const photoCacheDir = path.join(app.getPath('temp'), 'smart_device_link_photos');
+    if (!fs.existsSync(photoCacheDir)) fs.mkdirSync(photoCacheDir, { recursive: true });
+
+    async function scanAndCachePhotos() {
+        const activeDev = getFirstActiveDevice();
+        if (!activeDev || !sftpPlugin) return [];
+
+        try {
+            if (!sftpPlugin.sftpConfig) {
+                sftpPlugin.requestSftpMount(activeDev);
+                await new Promise((r) => setTimeout(r, 1200));
+            }
+            const rawFiles = await sftpPlugin.listDirectory('/sdcard/DCIM/Camera');
+            const imageFiles = rawFiles.filter((f) => !f.isDir && /\.(jpg|jpeg|png|webp|heic)$/i.test(f.name)).slice(0, 30);
+
+            const photoList = [];
+            for (const file of imageFiles) {
+                const localPath = path.join(photoCacheDir, file.name);
+                if (!fs.existsSync(localPath)) {
+                    try {
+                        await sftpPlugin.downloadFile(file.path, localPath);
+                    } catch (e) {
+                        console.warn(`[Bridge] Failed to download thumbnail for ${file.name}:`, e.message);
+                    }
+                }
+
+                photoList.push({
+                    id: file.name,
+                    name: file.name,
+                    path: file.path,
+                    url: `file:///${localPath.replace(/\\/g, '/')}`,
+                    date: file.modifyTime || Date.now(),
+                    size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`
+                });
+            }
+            return photoList;
+        } catch (err) {
+            console.warn('[Bridge] Photos scan failed:', err.message);
+            return [];
+        }
+    }
+
+    ipcMain.handle('get-photos', async () => {
+        return await scanAndCachePhotos();
+    });
+
+    ipcMain.on('scan-photos', async () => {
+        const photos = await scanAndCachePhotos();
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('photos-updated', photos);
+        }
+    });
+
+    ipcMain.on('download-file', async (event, { remotePath, name }) => {
+        const activeDev = getFirstActiveDevice();
+        if (!activeDev || !sftpPlugin) return;
+        try {
+            const downloadsFolder = app.getPath('downloads');
+            const destPath = path.join(downloadsFolder, name || path.basename(remotePath));
+            await sftpPlugin.downloadFile(remotePath, destPath);
+            console.log(`[Bridge] Downloaded ${name} to ${destPath}`);
+        } catch (e) {
+            console.error('[Bridge] Download failed:', e.message);
+        }
+    });
+    // Messaging Handlers
+    ipcMain.handle('get-sms-threads', () => {
+        return smsPlugin ? smsPlugin.getThreadsList() : [];
+    });
+
+    ipcMain.on('fetch-sms-threads', () => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && smsPlugin) smsPlugin.requestAllThreads(activeDev);
+    });
+
     ipcMain.on('send-sms', (event, { phoneNumber, messageText }) => {
         const activeDev = getFirstActiveDevice();
-        if (activeDev) smsPlugin.sendSms(activeDev, phoneNumber, messageText);
+        if (activeDev && smsPlugin) smsPlugin.sendSms(activeDev, phoneNumber, messageText);
+    });
+
+    // Contacts Handlers
+    ipcMain.handle('get-contacts', () => {
+        return contactsPlugin ? contactsPlugin.getContactsList() : [];
     });
 
     ipcMain.on('fetch-contacts', () => {
         const activeDev = getFirstActiveDevice();
-        if (activeDev) contactsPlugin.requestAllContacts(activeDev);
+        if (activeDev && contactsPlugin) contactsPlugin.requestAllContacts(activeDev);
     });
 
     ipcMain.on('share-url', (event, { url }) => {

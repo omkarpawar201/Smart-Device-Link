@@ -1,60 +1,38 @@
 import React, { useState, useEffect } from 'react';
-import { Image as ImageIcon, Download, Copy, RefreshCw, X, ZoomIn, Calendar, Sparkles } from 'lucide-react';
+import { Download, X } from 'lucide-react';
+import refreshIcon from './icons/refresh_icon.gif';
 
 export default function Photos({ device }) {
-    const [photos, setPhotos] = useState([
-        {
-            id: 'p1',
-            name: 'IMG_20260805_143021.jpg',
-            path: '/sdcard/DCIM/Camera/IMG_20260805_143021.jpg',
-            url: 'https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=800&q=80',
-            date: Date.now() - 1000 * 60 * 60 * 2,
-            size: '3.4 MB'
-        },
-        {
-            id: 'p2',
-            name: 'IMG_20260804_182010.jpg',
-            path: '/sdcard/DCIM/Camera/IMG_20260804_182010.jpg',
-            url: 'https://images.unsplash.com/photo-1511884642898-4c92249e20b6?w=800&q=80',
-            date: Date.now() - 1000 * 60 * 60 * 24,
-            size: '4.1 MB'
-        },
-        {
-            id: 'p3',
-            name: 'IMG_20260803_091544.jpg',
-            path: '/sdcard/DCIM/Camera/IMG_20260803_091544.jpg',
-            url: 'https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?w=800&q=80',
-            date: Date.now() - 1000 * 60 * 60 * 48,
-            size: '2.9 MB'
-        },
-        {
-            id: 'p4',
-            name: 'IMG_20260802_121000.jpg',
-            path: '/sdcard/DCIM/Camera/IMG_20260802_121000.jpg',
-            url: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800&q=80',
-            date: Date.now() - 1000 * 60 * 60 * 72,
-            size: '5.2 MB'
-        }
-    ]);
-
+    const [photos, setPhotos] = useState([]);
     const [selectedPhoto, setSelectedPhoto] = useState(null);
     const [isScanning, setIsScanning] = useState(false);
 
-    useEffect(() => {
-        if (window.api && window.api.onPhotosUpdated) {
-            window.api.onPhotosUpdated((newPhotos) => {
-                setPhotos(newPhotos);
-            });
-        }
-    }, []);
-
-    const handleRefresh = () => {
+    const fetchPhotos = () => {
         setIsScanning(true);
+        if (window.api && typeof window.api.invoke === 'function') {
+            const res = window.api.invoke('get-photos');
+            if (res && typeof res.then === 'function') {
+                res.then((list) => {
+                    if (Array.isArray(list)) setPhotos(list);
+                })
+                    .catch((err) => console.error(err))
+                    .finally(() => setTimeout(() => setIsScanning(false), 750));
+            }
+        }
         if (window.api && window.api.send) {
             window.api.send('scan-photos');
         }
-        setTimeout(() => setIsScanning(false), 2000);
     };
+
+    useEffect(() => {
+        fetchPhotos();
+
+        if (window.api && window.api.onPhotosUpdated) {
+            window.api.onPhotosUpdated((newPhotos) => {
+                if (Array.isArray(newPhotos)) setPhotos(newPhotos);
+            });
+        }
+    }, []);
 
     const handleDownload = (photo) => {
         if (window.api && window.api.send) {
@@ -63,6 +41,7 @@ export default function Photos({ device }) {
     };
 
     const formatDate = (ts) => {
+        if (!ts) return '';
         return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
     };
 
@@ -77,75 +56,81 @@ export default function Photos({ device }) {
                     </p>
                 </div>
 
-                <button className="btn-secondary" onClick={handleRefresh} disabled={isScanning}>
-                    <RefreshCw size={14} className={isScanning ? 'pulse-glow' : ''} />
+                <button className="btn-secondary" onClick={fetchPhotos} disabled={isScanning} style={{ fontSize: '12px', padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <img src={refreshIcon} alt="Refresh" style={{ width: '16px', height: '16px', objectFit: 'contain' }} />
                     <span>{isScanning ? 'Scanning DCIM...' : 'Refresh Photos'}</span>
                 </button>
             </div>
 
-            {/* Masonry Photo Grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '16px' }}>
-                {photos.map((photo) => (
-                    <div
-                        key={photo.id}
-                        className="glass-card animate-fade-in"
-                        style={{
-                            padding: 0,
-                            overflow: 'hidden',
-                            position: 'relative',
-                            borderRadius: 'var(--radius-md)',
-                            cursor: 'pointer',
-                            group: 'photo-card'
-                        }}
-                        onClick={() => setSelectedPhoto(photo)}
-                    >
-                        <img
-                            src={photo.url}
-                            alt={photo.name}
-                            style={{
-                                width: '100%',
-                                height: '200px',
-                                objectFit: 'cover',
-                                display: 'block',
-                                transition: 'transform 0.3s ease'
-                            }}
-                        />
-
-                        {/* Hover Action Gradient Overlay */}
+            {/* Photos Grid */}
+            {photos.length === 0 ? (
+                <div className="glass-panel" style={{ padding: '50px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                    {isScanning ? 'Scanning your phone camera roll via SFTP...' : 'No photos loaded yet. Tap "Refresh Photos" or ensure SFTP plugin is allowed on your phone.'}
+                </div>
+            ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '16px' }}>
+                    {photos.map((photo) => (
                         <div
+                            key={photo.id || photo.name}
+                            className="glass-card animate-fade-in"
                             style={{
-                                position: 'absolute',
-                                inset: 0,
-                                background: 'linear-gradient(to top, rgba(15, 23, 42, 0.85) 0%, transparent 60%)',
-                                display: 'flex',
-                                alignItems: 'flex-end',
-                                justifyContent: 'space-between',
-                                padding: '12px 14px',
-                                opacity: 0.9,
-                                transition: 'opacity 0.2s ease'
+                                padding: 0,
+                                overflow: 'hidden',
+                                position: 'relative',
+                                borderRadius: 'var(--radius-md)',
+                                cursor: 'pointer'
                             }}
+                            onClick={() => setSelectedPhoto(photo)}
                         >
-                            <div>
-                                <div style={{ fontSize: '12px', fontWeight: 600, color: '#ffffff' }}>{photo.name}</div>
-                                <div style={{ fontSize: '10px', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                                    {formatDate(photo.date)} • {photo.size}
-                                </div>
-                            </div>
-
-                            <button
-                                className="btn-primary"
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleDownload(photo);
+                            <img
+                                src={photo.url}
+                                alt={photo.name}
+                                style={{
+                                    width: '100%',
+                                    height: '200px',
+                                    objectFit: 'cover',
+                                    display: 'block'
                                 }}
-                                style={{ padding: '6px 10px', fontSize: '11px' }}
+                            />
+
+                            {/* Hover Action Gradient Overlay */}
+                            <div
+                                style={{
+                                    position: 'absolute',
+                                    inset: 0,
+                                    background: 'linear-gradient(to top, rgba(15, 23, 42, 0.85) 0%, transparent 60%)',
+                                    display: 'flex',
+                                    alignItems: 'flex-end',
+                                    justifyContent: 'space-between',
+                                    padding: '12px 14px',
+                                    opacity: 0.9
+                                }}
                             >
-                                <Download size={12} />
-                            </button>
+                                <div style={{ minWidth: 0, paddingRight: '8px' }}>
+                                    <div style={{ fontSize: '12px', fontWeight: 600, color: '#ffffff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                        {photo.name}
+                                    </div>
+                                    <div style={{ fontSize: '10px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                                        {formatDate(photo.date)} • {photo.size}
+                                    </div>
+                                </div>
+
+                                <button
+                                    className="btn-primary"
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDownload(photo);
+                                    }}
+                                    style={{ padding: '6px 10px', fontSize: '11px', flexShrink: 0 }}
+                                    title="Download to PC Downloads folder"
+                                >
+                                    <Download size={12} />
+                                </button>
+                            </div>
                         </div>
-                    </div>
-                ))}
-            </div>
+                    ))}
+                </div>
+            )}
 
             {/* Full-Screen Lightbox Preview Modal */}
             {selectedPhoto && (
@@ -164,7 +149,6 @@ export default function Photos({ device }) {
                     }}
                     className="animate-fade-in"
                 >
-                    {/* Lightbox Toolbar */}
                     <div
                         style={{
                             position: 'absolute',
@@ -197,7 +181,6 @@ export default function Photos({ device }) {
                         </button>
                     </div>
 
-                    {/* Expanded Preview Image */}
                     <img
                         src={selectedPhoto.url}
                         alt={selectedPhoto.name}
@@ -210,7 +193,6 @@ export default function Photos({ device }) {
                         }}
                     />
 
-                    {/* Photo Info Caption */}
                     <div style={{ textAlign: 'center', marginTop: '16px' }}>
                         <div style={{ fontSize: '16px', fontWeight: 600, color: 'var(--text-primary)' }}>{selectedPhoto.name}</div>
                         <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
