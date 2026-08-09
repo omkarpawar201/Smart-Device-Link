@@ -79,7 +79,7 @@ export default function DeviceStatus({ device }) {
                         <Wifi size={16} />
                     </div>
                     <div
-                        title={device.bluetooth ? 'Bluetooth Connected (HFP Audio)' : 'Bluetooth Standby'}
+                        title={device.bluetooth ? 'Bluetooth Link Connected (RFCOMM)' : 'Bluetooth Link Standby'}
                         style={{
                             padding: '6px',
                             borderRadius: 'var(--radius-sm)',

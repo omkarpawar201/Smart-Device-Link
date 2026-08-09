@@ -39,6 +39,33 @@ contextBridge.exposeInMainWorld('api', {
     onIncomingCall: (callback) => {
         ipcRenderer.on('incoming-call', (event, data) => callback(data));
     },
+    onCallIncoming: (callback) => {
+        ipcRenderer.on('call:incoming', (event, data) => callback(data));
+    },
+    onCallState: (callback) => {
+        ipcRenderer.on('call:state', (event, data) => callback(data));
+    },
+    onPhoneLinkState: (callback) => {
+        ipcRenderer.on('phone-link:state', (event, data) => callback(data));
+    },
+    onPhoneLinkReady: (callback) => {
+        ipcRenderer.on('phone-link:ready', (event, data) => callback(data));
+    },
+    onPhoneLinkError: (callback) => {
+        ipcRenderer.on('phone-link:error', (event, data) => callback(data));
+    },
+    onPhoneLinkPong: (callback) => {
+        ipcRenderer.on('phone-link:pong', (event, data) => callback(data));
+    },
+    onCallTalking: (callback) => {
+        ipcRenderer.on('call-talking', (event, data) => callback(data));
+    },
+    onCallEnded: (callback) => {
+        ipcRenderer.on('call-ended', (event, data) => callback(data));
+    },
+    onMissedCall: (callback) => {
+        ipcRenderer.on('missed-call', (event, data) => callback(data));
+    },
     onSmsThreadsUpdated: (callback) => {
         ipcRenderer.on('sms-threads-updated', (event, data) => callback(data));
     },
@@ -83,6 +110,8 @@ contextBridge.exposeInMainWorld('api', {
             'fetch-contacts',
             'share-url',
             'dial-number',
+            'mute-ringer',
+            'simulate-call',
             'download-file',
             'upload-file',
             'delete-file',
@@ -90,7 +119,10 @@ contextBridge.exposeInMainWorld('api', {
             'answer-call-audio',
             'hangup-call-audio',
             'toggle-mute-audio',
-            'transfer-call-audio'
+            'transfer-call-audio',
+            'phone-link:connect',
+            'phone-link:disconnect',
+            'phone-link:ping'
         ];
         if (validChannels.includes(channel)) {
             ipcRenderer.send(channel, data);
@@ -110,7 +142,8 @@ contextBridge.exposeInMainWorld('api', {
             'get-contacts',
             'get-photos',
             'get-clipboard-history',
-            'get-clipboard-auto-sync'
+            'get-clipboard-auto-sync',
+            'phone-link:list-devices'
         ];
         if (validChannels.includes(channel)) {
             return ipcRenderer.invoke(channel, data);

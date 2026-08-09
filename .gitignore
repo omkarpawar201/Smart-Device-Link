@@ -5,3 +5,16 @@ build/
 .env.local
 *.log
 .DS_Store
+impl plans
+
+# Android companion app build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+*.apk
+*.aab
+*.keystore
+*.jks

@@ -29,9 +29,9 @@ const SftpPlugin = require('../kdeconnect/plugins/SftpPlugin');
 // Real PC media session control (system media keys + master volume)
 const PcMediaController = require('../system/PcMediaController');
 
-// Phase 6 Bluetooth HFP Engine & Audio Bridge
-const BluetoothManager = require('../bluetooth/BluetoothManager');
-const HfpProtocol = require('../bluetooth/HfpProtocol');
+// Phase 6 Custom RFCOMM Link Engine & Audio Bridge
+const RfcommClient = require('../bluetooth/RfcommClient');
+const RfcommProtocol = require('../bluetooth/RfcommProtocol');
 const AudioBridge = require('../audio/AudioBridge');
 
 let cryptoHelper = null;
@@ -42,8 +42,8 @@ let activeDeviceConnections = new Map(); // deviceId -> Device instance
 let currentMainWindow = null;
 
 // Phase 6 Engine Instances
-let btManager = null;
-let hfpProtocol = null;
+let rfcommClient = null;
+let rfcommProtocol = null;
 let audioBridge = null;
 
 // Plugin Instances
@@ -80,9 +80,31 @@ function initKDEConnectBridge(mainWindow) {
     pairingManager = new PairingManager(packetRouter, cryptoHelper);
 
     // Phase 6 Bluetooth & Audio Setup
-    btManager = new BluetoothManager();
-    hfpProtocol = new HfpProtocol(btManager);
+    rfcommClient = new RfcommClient({
+        bridgeScript: path.join(__dirname, '..', 'bluetooth', 'rfcomm-bridge.ps1'),
+        configPath: path.join(app.getPath('userData'), 'phone-link.json')
+    });
+    rfcommProtocol = new RfcommProtocol(rfcommClient);
     audioBridge = new AudioBridge();
+
+    // Phone-link presence: engine is only alive while the RFCOMM link is up
+    rfcommProtocol.on('linkUp', () => {
+        console.log('[RfcommProtocol] Link established');
+        currentMainWindow?.webContents.send('phone-link:state', { connected: true });
+        currentMainWindow?.webContents.send('presence:update');
+    });
+    rfcommProtocol.on('linkDown', () => {
+        console.log('[RfcommProtocol] Link down');
+        currentMainWindow?.webContents.send('phone-link:state', { connected: false });
+        currentMainWindow?.webContents.send('presence:update');
+    });
+    rfcommProtocol.on('linkReady', () => {
+        currentMainWindow?.webContents.send('phone-link:ready');
+    });
+    rfcommClient.on('error', ({ code, message }) => {
+        console.warn(`[RfcommClient] error ${code}:`, message);
+        currentMainWindow?.webContents.send('phone-link:error', { code, message });
+    });
 
     // Real PC media session control (Windows-only; falls back to optimistic state if unavailable)
     if (process.platform === 'win32') pcMediaController = new PcMediaController();
@@ -271,6 +293,11 @@ function initKDEConnectBridge(mainWindow) {
             });
         }
 
+        // Start the RFCOMM phone link alongside the incoming Wi-Fi connection
+        if (rfcommClient && !rfcommClient.connected && !rfcommClient.connecting) {
+            rfcommClient.connect();
+        }
+
         // Request battery, connectivity, notifications, SMS threads, and contacts on initial connection
         if (batteryPlugin) batteryPlugin.requestBatteryStatus(tempDev);
         if (connectivityPlugin) connectivityPlugin.requestReport(tempDev);
@@ -399,6 +426,19 @@ function initKDEConnectBridge(mainWindow) {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('incoming-call', data);
     });
 
+    // Telephony call lifecycle events (from the phone via KDE Connect)
+    pluginEvents.on('callTalking', (data) => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('call-talking', data);
+    });
+
+    pluginEvents.on('callEnded', (data) => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('call-ended', data);
+    });
+
+    pluginEvents.on('missedCall', (data) => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('missed-call', data);
+    });
+
     pluginEvents.on('smsThreadsUpdated', (data) => {
         if (currentMainWindow && !currentMainWindow.isDestroyed()) currentMainWindow.webContents.send('sms-threads-updated', data);
     });
@@ -431,35 +471,38 @@ function initKDEConnectBridge(mainWindow) {
     });
 
 
-    // HFP Bluetooth Events
-    hfpProtocol.on('incomingCallRinging', () => {
-        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
-            currentMainWindow.webContents.send('incoming-call', { status: 'RINGING' });
-        }
-    });
-
-    hfpProtocol.on('callAnswered', () => {
-        audioBridge.startAudioRouting();
-    });
-
-    hfpProtocol.on('callEnded', () => {
-        audioBridge.stopAudioRouting();
-    });
-
-    // IPC Handlers for Call Audio Actions
+    // Call Control IPC Handlers (Accepts & Declines on BOTH Wi-Fi & Bluetooth)
     ipcMain.on('answer-call-audio', () => {
-        hfpProtocol.answerCall();
-        audioBridge.startAudioRouting();
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && telephonyPlugin) telephonyPlugin.acceptCall(activeDev);
+        if (rfcommProtocol) rfcommProtocol.answerCall();
+        if (audioBridge) audioBridge.startAudioRouting();
     });
 
     ipcMain.on('hangup-call-audio', () => {
-        hfpProtocol.hangupCall();
-        audioBridge.stopAudioRouting();
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && telephonyPlugin) telephonyPlugin.rejectCall(activeDev);
+        if (rfcommProtocol) rfcommProtocol.hangupCall();
+        if (audioBridge) audioBridge.stopAudioRouting();
+    });
+
+    ipcMain.on('decline-call', () => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && telephonyPlugin) telephonyPlugin.rejectCall(activeDev);
+        if (rfcommProtocol) rfcommProtocol.hangupCall();
+        if (audioBridge) audioBridge.stopAudioRouting();
+    });
+
+    ipcMain.on('answer-call', () => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && telephonyPlugin) telephonyPlugin.acceptCall(activeDev);
+        if (rfcommProtocol) rfcommProtocol.answerCall();
+        if (audioBridge) audioBridge.startAudioRouting();
     });
 
     ipcMain.on('toggle-mute-audio', (event, { muted }) => {
         audioBridge.setMicrophoneMuted(muted);
-        hfpProtocol.setMicrophoneVolume(muted ? 0 : 12);
+        rfcommProtocol.setMicMuted(muted);
     });
 
     ipcMain.on('transfer-call-audio', (event, { target }) => {
@@ -471,9 +514,69 @@ function initKDEConnectBridge(mainWindow) {
     });
 
     ipcMain.on('dial-number', (event, { number }) => {
-        console.log(`[Bridge] Dialing via Bluetooth HFP: ${number}`);
-        hfpProtocol.dialNumber(number);
+        console.log(`[Bridge] Dialing via RFCOMM: ${number}`);
+        rfcommProtocol.dialNumber(number);
         audioBridge.startAudioRouting();
+    });
+
+    // New RFCOMM link engine events -> renderer (replaces HFP bridge's wires)
+    rfcommProtocol.on('callRing', ({ number, name }) => {
+        currentMainWindow?.webContents.send('incoming-call', { status: 'RINGING', number, name });
+        currentMainWindow?.webContents.send('call:incoming', { number, name, ringing: true });
+    });
+    rfcommProtocol.on('callState', ({ state, number, name }) => {
+        currentMainWindow?.webContents.send('call:state', { state, number, name });
+        if (state === 'talking') {
+            audioBridge.startAudioRouting();
+        } else if (state === 'ended' || state === 'missed') {
+            audioBridge.stopAudioRouting();
+        }
+    });
+
+    // RFCOMM link control + discovery IPC
+    ipcMain.on('phone-link:connect', (event, { mac, name } = {}) => {
+        rfcommClient.connect({ mac, name });
+    });
+    ipcMain.on('phone-link:disconnect', () => {
+        rfcommClient.disconnect();
+        audioBridge.stopAudioRouting();
+    });
+
+    // Presence: recompute "last seen" using the phone-side link clock
+    ipcMain.on('phone-link:ping', (event, { id }) => {
+        let lastSeen = 0;
+        if (rfcommProtocol.connected) lastSeen = rfcommProtocol.lastPongAt || Date.now();
+        event.sender.send('phone-link:pong', { id, lastSeen });
+    });
+
+    // List paired classic-Bluetooth phones for the pairing UI
+    ipcMain.handle('phone-link:list-devices', async () => {
+        try {
+            const devices = await rfcommClient.discoverPairedDevices();
+            return { ok: true, devices };
+        } catch (e) {
+            return { ok: false, error: e.message };
+        }
+    });
+
+    // Silences the phone's ringer for an incoming call (KDE Connect request_mute packet)
+    ipcMain.on('mute-ringer', () => {
+        const activeDev = getFirstActiveDevice();
+        if (activeDev && telephonyPlugin) telephonyPlugin.requestMute(activeDev);
+    });
+
+    // Diagnostic: inject a fake incoming call through the same plugin event channel the phone
+    // packets use, so the renderer pipeline can be verified without a connected phone.
+    ipcMain.on('simulate-call', () => {
+        console.log('[Bridge] Simulating incoming call (diagnostic, no phone required)');
+        pluginEvents.emit('incomingCall', {
+            deviceId: 'simulated',
+            phoneNumber: '+1 (555) 123-4567',
+            contactName: 'Test Caller',
+            phoneThumbnail: null,
+            event: 'ringing',
+            timestamp: Date.now()
+        });
     });
 
     // Storage & Files Handlers
@@ -923,7 +1026,7 @@ function initKDEConnectBridge(mainWindow) {
         return { success: true };
     });
 
-    return { cryptoHelper, deviceManager, packetRouter, pairingManager, btManager, hfpProtocol, audioBridge };
+    return { cryptoHelper, deviceManager, packetRouter, pairingManager, rfcommClient, rfcommProtocol, audioBridge };
 }
 
 function getFirstActiveDevice() {
@@ -997,8 +1100,10 @@ function connectToDevice(deviceInfo, mainWindow) {
             });
         }
 
-        // Connect Bluetooth HFP channel alongside KDE Connect TCP link
-        btManager.connectHfp(info.ip);
+        // Start the RFCOMM phone link alongside the KDE Connect TCP link
+        if (rfcommClient && !rfcommClient.connected && !rfcommClient.connecting) {
+            rfcommClient.connect();
+        }
 
         notificationPlugin.requestAllNotifications(deviceConnection);
         batteryPlugin.requestBatteryStatus(deviceConnection);
@@ -1020,7 +1125,7 @@ function connectToDevice(deviceInfo, mainWindow) {
 
     deviceConnection.on('disconnected', ({ info }) => {
         activeDeviceConnections.delete(info.id);
-        btManager.disconnectHfp();
+        if (rfcommClient) rfcommClient.drop();
         const win = currentMainWindow || mainWindow;
         if (win && !win.isDestroyed()) {
             win.webContents.send('device-status-changed', { name: info.name, connected: false });
