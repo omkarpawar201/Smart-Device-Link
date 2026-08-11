@@ -16,6 +16,28 @@ class TelephonyPlugin extends BasePlugin {
             const body = packet.body || {};
             const event = body.event || '';
 
+            // The phone resends the last packet (ringing/talking) with isCancel=true to signal the
+            // call ended, so it must be checked before the event-specific branches below.
+            if (body.isCancel) {
+                const endedData = this.activeCall
+                    ? { ...this.activeCall, event: 'ended', isCancel: true }
+                    : {
+                        deviceId: device.info.id,
+                        phoneNumber: body.phoneNumber || 'Unknown Number',
+                        contactName: body.contactName || body.phoneNumber || 'Unknown Caller',
+                        phoneThumbnail: body.phoneThumbnail || null,
+                        event: 'ended',
+                        isCancel: true,
+                        timestamp: Date.now()
+                    };
+                this.activeCall = null;
+                console.log(`[TelephonyPlugin] Call ended on ${device.info.name} (${endedData.contactName} - ${endedData.phoneNumber})`);
+                if (this.emitter) {
+                    this.emitter.emit('callEnded', endedData);
+                }
+                return;
+            }
+
             const callData = {
                 deviceId: device.info.id,
                 phoneNumber: body.phoneNumber || 'Unknown Number',
@@ -44,13 +66,34 @@ class TelephonyPlugin extends BasePlugin {
                 if (this.emitter) {
                     this.emitter.emit('callTalking', callData);
                 }
-            } else if (body.isCancel) {
-                this.activeCall = null;
-                if (this.emitter) {
-                    this.emitter.emit('callEnded', callData);
-                }
             }
         }
+    }
+
+    acceptCall(device) {
+        if (!device) return false;
+
+        const acceptPacket = {
+            id: Date.now(),
+            type: 'kdeconnect.telephony.request',
+            body: { action: 'accept' }
+        };
+
+        console.log(`[TelephonyPlugin] Sending Accept Call request to ${device.info.name}`);
+        return device.sendPacket(acceptPacket);
+    }
+
+    rejectCall(device) {
+        if (!device) return false;
+
+        const rejectPacket = {
+            id: Date.now(),
+            type: 'kdeconnect.telephony.request',
+            body: { action: 'reject' }
+        };
+
+        console.log(`[TelephonyPlugin] Sending Reject Call request to ${device.info.name}`);
+        return device.sendPacket(rejectPacket);
     }
 
     requestMute(device) {

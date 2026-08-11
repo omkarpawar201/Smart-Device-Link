@@ -95,6 +95,11 @@ class RfcommProtocol extends EventEmitter {
             case 'pong':
                 this.lastPongAt = Date.now();
                 break;
+            case 'ping':
+                // The phone's own heartbeat expects a pong within ~15s, or it
+                // drops the link. Answer it like the phone answers ours.
+                this.sendMessage({ t: 'pong' });
+                break;
             case 'hello':
                 // Reply with our own hello to complete the two-way handshake.
                 this.sendMessage({ t: 'hello', v: 1 });

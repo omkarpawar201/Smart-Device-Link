@@ -25,6 +25,9 @@ class RfcommClient extends EventEmitter {
         this.reconnectDelayMs = 3000;
         this.reconnectTimer = null;
         this.manualAddress = null;
+        // Phone-initiated server mode: this phone will not answer PC-initiated
+        // connect() calls, so the bridge runs as the RFCOMM listener by default.
+        this.listen = options.listen !== false;
     }
 
     // ---------- config persistence ----------
@@ -67,9 +70,8 @@ class RfcommClient extends EventEmitter {
             const script = `
 $ErrorActionPreference = 'SilentlyContinue'
 $list = @()
-Get-PnpDevice -Class Bluetooth -PresentOnly | Where-Object { $_.FriendlyName } | ForEach-Object {
-    $mac = $null
-    if ($_.InstanceId -match '(?i)DEV_([0-9A-F]{12})') { $mac = $matches[1] }
+Get-PnpDevice -Class Bluetooth | Where-Object { $_.FriendlyName -and $_.InstanceId -match '(?i)DEV_([0-9A-F]{12})' } | ForEach-Object {
+    $mac = $matches[1]
     if (-not $mac) {
         $prop = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Bluetooth_DeviceAddress' -ErrorAction SilentlyContinue
         if ($prop -and $prop.Data) { $mac = ($prop.Data.ToString() -replace '[^0-9a-fA-F]', '') }
@@ -154,6 +156,9 @@ $list | Select-Object -Unique | ConvertTo-Json -Compress
         let target = null;
         if (mac) {
             target = { mac, name: name || this.connectedName || 'Phone' };
+        } else if (this.listen) {
+            // In server mode the phone initiates, so no target address is needed.
+            target = { mac: null, name: this.connectedName || 'Phone' };
         } else {
             target = await this.resolvePhoneMac(name);
         }
@@ -183,12 +188,21 @@ $list | Select-Object -Unique | ConvertTo-Json -Compress
             return;
         }
 
+        // Never run two listeners: each bridge registers its own SDP record, and a
+        // second registration overwrites the first, so a late duplicate spawn would
+        // repoint the phone at a different channel. Kill any prior bridge first.
+        if (this.child) {
+            try { this.child.kill(); } catch (e) { /* ignore */ }
+            this.child = null;
+        }
+
         const args = [
             '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-            '-File', this.bridgeScript,
-            '-Mac', mac,
-            '-Guid', this.serviceUuid
+            '-File', this.bridgeScript
         ];
+        if (this.listen) args.push('-Listen');
+        args.push('-Guid', this.serviceUuid);
+        if (mac) args.push('-Mac', mac);
 
         let child;
         try {
@@ -245,7 +259,8 @@ $list | Select-Object -Unique | ConvertTo-Json -Compress
     }
 
     handleStatusLine(line) {
-        if (line.startsWith('[STATUS] CONNECTED')) {
+        if (line.startsWith('[STATUS] CONNECTED') || line.startsWith('[STATUS] ACCEPTED')) {
+            console.log(`[RfcommClient] RFCOMM link up: ${line}`);
             this.connecting = false;
             this.connected = true;
             this.bridgeReady = true;

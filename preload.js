@@ -78,6 +78,9 @@ contextBridge.exposeInMainWorld('api', {
     onUploadProgress: (callback) => {
         ipcRenderer.on('upload-progress', (event, data) => callback(data));
     },
+    onMirrorStatus: (callback) => {
+        ipcRenderer.on('mirror:status', (event, data) => callback(data));
+    },
 
     // Resolve an absolute filesystem path for a File object from a drag/drop or file input
     // (Electron removed File.path; this is the supported replacement).
@@ -122,7 +125,9 @@ contextBridge.exposeInMainWorld('api', {
             'transfer-call-audio',
             'phone-link:connect',
             'phone-link:disconnect',
-            'phone-link:ping'
+            'phone-link:ping',
+            'mirror:start',
+            'mirror:stop'
         ];
         if (validChannels.includes(channel)) {
             ipcRenderer.send(channel, data);
@@ -143,7 +148,9 @@ contextBridge.exposeInMainWorld('api', {
             'get-photos',
             'get-clipboard-history',
             'get-clipboard-auto-sync',
-            'phone-link:list-devices'
+            'phone-link:list-devices',
+            'mirror:list-devices',
+            'mirror:status'
         ];
         if (validChannels.includes(channel)) {
             return ipcRenderer.invoke(channel, data);

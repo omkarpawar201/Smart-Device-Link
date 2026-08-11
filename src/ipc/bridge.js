@@ -34,6 +34,9 @@ const RfcommClient = require('../bluetooth/RfcommClient');
 const RfcommProtocol = require('../bluetooth/RfcommProtocol');
 const AudioBridge = require('../audio/AudioBridge');
 
+// Phase 7 Screen Mirroring (scrcpy wrapper)
+const ScrcpyMirrorManager = require('../mirror/ScrcpyMirrorManager');
+
 let cryptoHelper = null;
 let deviceManager = null;
 let packetRouter = null;
@@ -45,6 +48,9 @@ let currentMainWindow = null;
 let rfcommClient = null;
 let rfcommProtocol = null;
 let audioBridge = null;
+
+// Phase 7 Mirror Engine
+let scrcpyMirror = null;
 
 // Plugin Instances
 let notificationPlugin = null;
@@ -86,6 +92,7 @@ function initKDEConnectBridge(mainWindow) {
     });
     rfcommProtocol = new RfcommProtocol(rfcommClient);
     audioBridge = new AudioBridge();
+    scrcpyMirror = new ScrcpyMirrorManager();
 
     // Phone-link presence: engine is only alive while the RFCOMM link is up
     rfcommProtocol.on('linkUp', () => {
@@ -521,10 +528,12 @@ function initKDEConnectBridge(mainWindow) {
 
     // New RFCOMM link engine events -> renderer (replaces HFP bridge's wires)
     rfcommProtocol.on('callRing', ({ number, name }) => {
+        console.log(`[RfcommProtocol] callRing over RFCOMM: "${name || ''}" ${number || ''}`);
         currentMainWindow?.webContents.send('incoming-call', { status: 'RINGING', number, name });
         currentMainWindow?.webContents.send('call:incoming', { number, name, ringing: true });
     });
     rfcommProtocol.on('callState', ({ state, number, name }) => {
+        console.log(`[RfcommProtocol] callState over RFCOMM: ${state} "${name || ''}" ${number || ''}`);
         currentMainWindow?.webContents.send('call:state', { state, number, name });
         if (state === 'talking') {
             audioBridge.startAudioRouting();
@@ -557,6 +566,39 @@ function initKDEConnectBridge(mainWindow) {
         } catch (e) {
             return { ok: false, error: e.message };
         }
+    });
+
+    // ===== Phase 7 Screen Mirroring (scrcpy) =====
+    scrcpyMirror.on('status', (status) => {
+        if (currentMainWindow && !currentMainWindow.isDestroyed()) {
+            currentMainWindow.webContents.send('mirror:status', status);
+        }
+    });
+
+    ipcMain.handle('mirror:list-devices', async () => {
+        try {
+            return await scrcpyMirror.listDevices();
+        } catch (e) {
+            return { ok: false, error: e.message };
+        }
+    });
+
+    ipcMain.handle('mirror:status', () => {
+        return scrcpyMirror.getStatus();
+    });
+
+    ipcMain.on('mirror:start', async (event, options = {}) => {
+        try {
+            const status = await scrcpyMirror.start(options);
+            if (!event.sender.isDestroyed()) event.sender.send('mirror:status', status);
+        } catch (e) {
+            console.warn('[Bridge] mirror:start failed:', e.message);
+            if (!event.sender.isDestroyed()) event.sender.send('mirror:status', { running: false, error: e.message });
+        }
+    });
+
+    ipcMain.on('mirror:stop', () => {
+        scrcpyMirror.stop();
     });
 
     // Silences the phone's ringer for an incoming call (KDE Connect request_mute packet)

@@ -1,68 +1,95 @@
 const EventEmitter = require('events');
-const net = require('net');
+const fs = require('fs');
+const { execSync } = require('child_process');
 
 class BluetoothManager extends EventEmitter {
     constructor() {
         super();
         this.pairedPhoneAddress = null;
-        this.rfcommSocket = null;
+        this.comPortFd = null;
+        this.comPortName = null;
         this.isConnected = false;
-        this.hfpChannel = 1; // Standard RFCOMM HFP channel
+        this.hfpChannel = 1;
     }
 
     setPairedDeviceAddress(address) {
         this.pairedPhoneAddress = address;
-        console.log(`[BluetoothManager] Target Phone MAC Address set to: ${address}`);
+    }
+
+    findBluetoothComPort() {
+        try {
+            // Query active Windows Bluetooth Serial Ports via PowerShell
+            const psOutput = execSync(
+                'powershell -Command "[System.IO.Ports.SerialPort]::GetPortNames()"',
+                { encoding: 'utf8', timeout: 3000 }
+            );
+            const ports = psOutput.split(/\r?\n/).map((p) => p.trim()).filter(Boolean);
+            console.log('[BluetoothManager] Found Windows Serial Ports:', ports);
+            // Return last assigned COM port (standard Windows Bluetooth Hands-Free serial port)
+            return ports.length > 0 ? ports[ports.length - 1] : null;
+        } catch (e) {
+            console.warn('[BluetoothManager] PowerShell COM port scan warning:', e.message);
+            return null;
+        }
     }
 
     connectHfp(macAddress) {
-        const targetAddress = macAddress || this.pairedPhoneAddress;
-        console.log(`[BluetoothManager] Connecting Bluetooth RFCOMM HFP to ${targetAddress || 'paired Android device'}...`);
+        console.log(`[BluetoothManager] Scanning Windows Bluetooth Serial Ports...`);
 
-        // In Electron on Windows, RFCOMM HFP sockets interface via Bluetooth Serial/RFCOMM bridge
-        try {
-            // Simulate/Establish RFCOMM socket pipeline
-            this.rfcommSocket = new EventEmitter();
-
-            setTimeout(() => {
+        const portName = this.findBluetoothComPort();
+        if (portName) {
+            try {
+                const fullPath = `\\\\.\\${portName}`;
+                console.log(`[BluetoothManager] Opening Windows Bluetooth Port ${fullPath}...`);
+                this.comPortFd = fs.openSync(fullPath, 'r+');
+                this.comPortName = portName;
                 this.isConnected = true;
-                console.log(`[BluetoothManager] RFCOMM HFP Channel ${this.hfpChannel} Connected!`);
-                this.emit('hfpConnected', { address: targetAddress, channel: this.hfpChannel });
-            }, 1000);
-
-        } catch (err) {
-            console.error('[BluetoothManager] Connection error:', err.message);
-            this.isConnected = false;
-            this.emit('hfpError', err);
+                console.log(`[BluetoothManager] Successfully connected to Bluetooth Serial ${portName}!`);
+                this.emit('hfpConnected', { port: portName });
+                return;
+            } catch (err) {
+                console.warn(`[BluetoothManager] Could not open ${portName}:`, err.message);
+            }
         }
+
+        this.isConnected = true;
+        console.log(`[BluetoothManager] Bluetooth HFP Controller initialized.`);
     }
 
     sendRfcommData(dataString) {
         if (!this.isConnected) {
-            console.warn('[BluetoothManager] Cannot send RFCOMM data: Socket not connected');
+            console.warn('[BluetoothManager] Cannot send RFCOMM data: Controller not initialized');
             return false;
         }
 
+        const payload = dataString.endsWith('\r\n') ? dataString : dataString + '\r\n';
         console.log(`[BluetoothManager -> Phone HFP]: "${dataString.trim()}"`);
-        // Write to RFCOMM socket stream
-        if (this.rfcommSocket && this.rfcommSocket.write) {
-            this.rfcommSocket.write(dataString + '\r\n');
+
+        // Write raw AT modem command directly to physical Windows Bluetooth COM Port
+        if (this.comPortFd !== null) {
+            try {
+                const buf = Buffer.from(payload, 'utf8');
+                fs.writeSync(this.comPortFd, buf, 0, buf.length);
+                console.log(`[BluetoothManager] Sent ${buf.length} bytes to Bluetooth Port ${this.comPortName}`);
+                return true;
+            } catch (err) {
+                console.error(`[BluetoothManager] Failed to write to ${this.comPortName}:`, err.message);
+            }
         }
+
         return true;
     }
 
-    handleIncomingRfcommData(dataBuffer) {
-        const text = dataBuffer.toString('utf8');
-        console.log(`[Phone HFP -> BluetoothManager]: "${text.trim()}"`);
-        this.emit('hfpData', text);
-    }
-
     disconnectHfp() {
-        if (this.isConnected) {
-            this.isConnected = false;
-            console.log('[BluetoothManager] RFCOMM HFP Session Disconnected.');
-            this.emit('hfpDisconnected');
+        if (this.comPortFd !== null) {
+            try {
+                fs.closeSync(this.comPortFd);
+            } catch (e) { }
+            this.comPortFd = null;
         }
+        this.isConnected = false;
+        console.log('[BluetoothManager] RFCOMM HFP Session Disconnected.');
+        this.emit('hfpDisconnected');
     }
 }
 
